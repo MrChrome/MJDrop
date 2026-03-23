@@ -158,15 +158,56 @@ nonisolated struct MilkFileParser {
         perFrame.sort { $0.0 < $1.0 }
         perPixel.sort { $0.0 < $1.0 }
 
+        // Join continuation lines: in Milkdrop, a line that doesn't end with ';'
+        // is continued on the next line
+        let joinedFrameInit = joinContinuationLines(perFrameInit.map { $0.1 })
+        let joinedFrame = joinContinuationLines(perFrame.map { $0.1 })
+        let joinedPixel = joinContinuationLines(perPixel.map { $0.1 })
+
         // Parse each expression line
-        p.perFrameInitExpressions = perFrameInit.flatMap { ExpressionParser.parseLine($0.1, builder: builder) }
-        p.perFrameExpressions = perFrame.flatMap { ExpressionParser.parseLine($0.1, builder: builder) }
-        p.perPixelExpressions = perPixel.flatMap { ExpressionParser.parseLine($0.1, builder: builder) }
+        p.perFrameInitExpressions = joinedFrameInit.flatMap { ExpressionParser.parseLine($0, builder: builder) }
+        p.perFrameExpressions = joinedFrame.flatMap { ExpressionParser.parseLine($0, builder: builder) }
+        p.perPixelExpressions = joinedPixel.flatMap { ExpressionParser.parseLine($0, builder: builder) }
 
         // Build the immutable table and bridge
         let table = builder.build()
         p.variableTable = table
         p.contextBridge = ContextBridge(table: table)
+    }
+
+    // MARK: - Continuation Line Joining
+
+    /// Join lines that don't end with a semicolon with the next line.
+    /// In Milkdrop's EEL2 language, a line without a trailing ';' continues
+    /// on the next numbered line.
+    private static func joinContinuationLines(_ lines: [String]) -> [String] {
+        var result: [String] = []
+        var accumulator = ""
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                // Empty lines don't affect continuation; flush accumulator
+                if !accumulator.isEmpty {
+                    result.append(accumulator)
+                    accumulator = ""
+                }
+                continue
+            }
+            if accumulator.isEmpty {
+                accumulator = trimmed
+            } else {
+                accumulator += trimmed
+            }
+            if accumulator.hasSuffix(";") {
+                result.append(accumulator)
+                accumulator = ""
+            }
+        }
+        // Flush any remaining expression (may not end with ';')
+        if !accumulator.isEmpty {
+            result.append(accumulator)
+        }
+        return result
     }
 
     // MARK: - Custom Wave Compilation
@@ -235,9 +276,13 @@ nonisolated struct MilkFileParser {
         perFrameLines.sort { $0.0 < $1.0 }
         perPointLines.sort { $0.0 < $1.0 }
 
-        let initExprs = initLines.flatMap { ExpressionParser.parseLine($0.1, builder: builder) }
-        let perFrameExprs = perFrameLines.flatMap { ExpressionParser.parseLine($0.1, builder: builder) }
-        let perPointExprs = perPointLines.flatMap { ExpressionParser.parseLine($0.1, builder: builder) }
+        let joinedInit = joinContinuationLines(initLines.map { $0.1 })
+        let joinedPerFrame = joinContinuationLines(perFrameLines.map { $0.1 })
+        let joinedPerPoint = joinContinuationLines(perPointLines.map { $0.1 })
+
+        let initExprs = joinedInit.flatMap { ExpressionParser.parseLine($0, builder: builder) }
+        let perFrameExprs = joinedPerFrame.flatMap { ExpressionParser.parseLine($0, builder: builder) }
+        let perPointExprs = joinedPerPoint.flatMap { ExpressionParser.parseLine($0, builder: builder) }
 
         let table = builder.build()
         let bridge = CustomWaveBridge(table: table)
@@ -328,8 +373,11 @@ nonisolated struct MilkFileParser {
         initLines.sort { $0.0 < $1.0 }
         perFrameLines.sort { $0.0 < $1.0 }
 
-        let initExprs = initLines.flatMap { ExpressionParser.parseLine($0.1, builder: builder) }
-        let perFrameExprs = perFrameLines.flatMap { ExpressionParser.parseLine($0.1, builder: builder) }
+        let joinedInit = joinContinuationLines(initLines.map { $0.1 })
+        let joinedPerFrame = joinContinuationLines(perFrameLines.map { $0.1 })
+
+        let initExprs = joinedInit.flatMap { ExpressionParser.parseLine($0, builder: builder) }
+        let perFrameExprs = joinedPerFrame.flatMap { ExpressionParser.parseLine($0, builder: builder) }
 
         let table = builder.build()
         let bridge = CustomShapeBridge(table: table)

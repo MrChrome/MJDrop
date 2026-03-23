@@ -14,6 +14,8 @@ struct ContentView: View {
     @State private var presetManager = PresetManager()
     @State private var showingFilePicker = false
     @State private var showingPresetFolderPicker = false
+    @State private var showingPresetList = false
+    @State private var presetSearchText = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -38,7 +40,7 @@ struct ContentView: View {
                         .truncationMode(.middle)
                         .frame(maxWidth: .infinity, alignment: .leading)
 
-                    // Preset info
+                    // Preset info — click to open preset list
                     HStack(spacing: 4) {
                         Text("\(presetManager.currentIndex + 1)/\(presetManager.presetCount)")
                             .font(.system(.caption2, design: .monospaced))
@@ -49,12 +51,24 @@ struct ContentView: View {
                             .lineLimit(1)
                             .truncationMode(.tail)
                             .frame(maxWidth: 200, alignment: .trailing)
-                            .contextMenu {
-                                Button("Copy Preset Name") {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(presetManager.currentName, forType: .string)
-                                }
-                            }
+                    }
+                    .onTapGesture {
+                        presetSearchText = ""
+                        showingPresetList.toggle()
+                    }
+                    .help("Click to browse presets")
+                    .popover(isPresented: $showingPresetList, arrowEdge: .bottom) {
+                        PresetListView(
+                            presetManager: presetManager,
+                            searchText: $presetSearchText,
+                            isPresented: $showingPresetList
+                        )
+                    }
+                    .contextMenu {
+                        Button("Copy Preset Name") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(presetManager.currentName, forType: .string)
+                        }
                     }
 
                     // Time display
@@ -152,6 +166,74 @@ struct ContentView: View {
         let minutes = Int(time) / 60
         let seconds = Int(time) % 60
         return String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
+// MARK: - Preset List View
+
+struct PresetListView: View {
+    let presetManager: PresetManager
+    @Binding var searchText: String
+    @Binding var isPresented: Bool
+
+    private var filteredPresets: [(index: Int, preset: PresetParameters)] {
+        let all = presetManager.presets.enumerated().map { (index: $0.offset, preset: $0.element) }
+        if searchText.isEmpty { return all }
+        let query = searchText.lowercased()
+        return all.filter { $0.preset.name.lowercased().contains(query) }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Search field
+            HStack {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search presets…", text: $searchText)
+                    .textFieldStyle(.plain)
+                if !searchText.isEmpty {
+                    Button(action: { searchText = "" }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+            .padding(8)
+
+            Divider()
+
+            // Preset list
+            ScrollViewReader { proxy in
+                List(filteredPresets, id: \.index) { item in
+                    Button(action: {
+                        presetManager.selectPreset(at: item.index)
+                        isPresented = false
+                    }) {
+                        HStack {
+                            Text(item.preset.name)
+                                .font(.system(.caption, design: .monospaced))
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Spacer()
+                            if item.index == presetManager.currentIndex {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(.cyan)
+                                    .font(.caption2)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .id(item.index)
+                }
+                .listStyle(.plain)
+                .onAppear {
+                    proxy.scrollTo(presetManager.currentIndex, anchor: .center)
+                }
+            }
+        }
+        .frame(width: 400, height: 350)
     }
 }
 

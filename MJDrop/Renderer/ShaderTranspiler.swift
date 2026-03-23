@@ -204,10 +204,19 @@ struct ShaderTranspiler {
             options: .regularExpression
         )
 
+        // Fix variable redefinitions: when a variable is declared in pre-body
+        // (e.g. `float3 neu, ret1;`) and then re-declared in body
+        // (e.g. `float3 ret1 = 0;`), convert the second to an assignment.
+        s = fixVariableRedefinitions(s)
+
         // Handle HLSL implicit truncation for known float4 uniforms used as scalars.
         // When these appear in arithmetic without a swizzle, HLSL auto-truncates.
         // We handle this by inserting explicit swizzles where needed.
         s = fixImplicitTruncation(s)
+
+        // Convert HLSL `%` modulo operator to Metal `fmod()`.
+        // HLSL allows `%` on float operands; Metal requires `fmod()`.
+        s = convertModuloToFmod(s)
 
         return s
     }
@@ -321,6 +330,64 @@ struct ShaderTranspiler {
         return result
     }
 
+    // MARK: - Variable Redefinition Fix
+
+    /// HLSL (and some Milkdrop presets) declare variables in pre-body
+    /// (e.g. `float3 neu, ret1;`) then re-declare them inside the body
+    /// (e.g. `float3 ret1 = 0;`). Metal/C++ doesn't allow this in the same scope.
+    /// This pass tracks declared variable names and converts re-declarations to assignments.
+    private static func fixVariableRedefinitions(_ source: String) -> String {
+        var lines = source.components(separatedBy: "\n")
+        // Track all declared variable names and their types
+        var declaredVars: [String: String] = [:]  // varName -> type
+
+        // Pattern to match declarations: `float3 varname` or `float2 a, b, c;`
+        let declPattern = #"(?m)^\s*(float[234]?|int|bool)\s+(.+?)\s*;"#
+        guard let declRegex = try? NSRegularExpression(pattern: declPattern) else { return source }
+
+        for lineIdx in 0..<lines.count {
+            let line = lines[lineIdx]
+            let nsLine = line as NSString
+            let matches = declRegex.matches(in: line, range: NSRange(location: 0, length: nsLine.length))
+
+            for match in matches {
+                let type = nsLine.substring(with: match.range(at: 1))
+                let varsSection = nsLine.substring(with: match.range(at: 2))
+
+                // Parse variable names from comma-separated list, handling initializers
+                let parts = varsSection.components(separatedBy: ",")
+                for part in parts {
+                    let trimmed = part.trimmingCharacters(in: .whitespaces)
+                    // Extract just the variable name (before any `=` or space)
+                    let varName = String(trimmed.prefix(while: { $0.isLetter || $0.isNumber || $0 == "_" }))
+                    if varName.isEmpty { continue }
+
+                    if declaredVars[varName] != nil {
+                        // This variable was already declared — convert to assignment
+                        // Replace `float3 ret1 = 0;` with `ret1 = 0;`
+                        // Replace `float3 ret1;` with nothing (redundant)
+                        let redeclPattern = "\\b\(NSRegularExpression.escapedPattern(for: type))\\s+\(NSRegularExpression.escapedPattern(for: varName))\\b"
+                        if let redeclRegex = try? NSRegularExpression(pattern: redeclPattern) {
+                            let mutableLine = NSMutableString(string: lines[lineIdx])
+                            redeclRegex.replaceMatches(in: mutableLine, range: NSRange(location: 0, length: mutableLine.length), withTemplate: varName)
+                            lines[lineIdx] = mutableLine as String
+
+                            // If the line is now just `varName;` (no initializer), remove it
+                            let stripped = lines[lineIdx].trimmingCharacters(in: .whitespaces)
+                            if stripped == "\(varName);" || stripped == "\(varName) ;" {
+                                lines[lineIdx] = ""
+                            }
+                        }
+                    } else {
+                        declaredVars[varName] = type
+                    }
+                }
+            }
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: - HLSL Implicit Truncation Fix
 
     /// HLSL allows implicit narrowing: float4→float, float4→float3, float2→float.
@@ -368,6 +435,11 @@ struct ShaderTranspiler {
         //    When a `float2(` constructor or known float2 var appears in `+` or `-`
         //    with a float3 expression, wrap in float3(..., 0).
         s = fixMixedVectorArithmetic(s)
+
+        // 6. Fix float3 variables used in float2 context (HLSL implicit truncation).
+        //    When a float3 variable (e.g. noise from texture sample) is used in
+        //    arithmetic with float2 variables, add `.xy` to truncate it.
+        s = fixFloat3ToFloat2Truncation(s)
 
         return s
     }
@@ -435,9 +507,32 @@ struct ShaderTranspiler {
 
             if hasFloat3 && hasFloat2 {
                 var line = lines[lineIdx]
-                // Only wrap float2 vars that are NOT inside .sample() or _md_Get* calls
-                // Simple heuristic: wrap them everywhere, which is fine for `ret =` lines
-                // since the whole line is being assigned to float3
+
+                // Mask out _md_GetPixel(...), _md_GetBlur1/2/3(...) args.
+                // These macros expect float2 UVs — float2 vars inside should NOT be promoted.
+                var masks: [(placeholder: String, original: String)] = []
+                let getMacros = ["_md_GetPixel", "_md_GetBlur1", "_md_GetBlur2", "_md_GetBlur3"]
+                for macro in getMacros {
+                    while let macroRange = line.range(of: macro + "(") {
+                        let afterOpen = macroRange.upperBound
+                        // Find matching close paren
+                        var depth = 1
+                        var idx = afterOpen
+                        while idx < line.endIndex && depth > 0 {
+                            if line[idx] == "(" { depth += 1 }
+                            else if line[idx] == ")" { depth -= 1 }
+                            if depth > 0 { idx = line.index(after: idx) }
+                        }
+                        guard idx < line.endIndex else { break }
+                        let closeIdx = line.index(after: idx)
+                        let fullCall = String(line[macroRange.lowerBound..<closeIdx])
+                        let placeholder = "___MASK\(masks.count)___"
+                        masks.append((placeholder, fullCall))
+                        line = line.replacingCharacters(in: macroRange.lowerBound..<closeIdx, with: placeholder)
+                    }
+                }
+
+                // Wrap float2 vars in _md_f3()
                 for varName in float2Vars {
                     line = line.replacingOccurrences(
                         of: "(?<!float2 |float2\\t|_md_f3\\()\\b\(varName)\\b(?!\\s*[.\\[=])",
@@ -452,6 +547,12 @@ struct ShaderTranspiler {
                     options: .regularExpression
                 )
                 line = closeF3Wrappers(line)
+
+                // Restore masked macro calls
+                for mask in masks.reversed() {
+                    line = line.replacingOccurrences(of: mask.placeholder, with: mask.original)
+                }
+
                 lines[lineIdx] = line
             }
         }
@@ -498,8 +599,21 @@ struct ShaderTranspiler {
     /// Smart enough to skip cases where the float2 var is inside a scalar-returning function
     /// like `length()`, `dot()`, `distance()`, etc.
     private static func fixScalarAssignments(_ source: String) -> String {
-        // Known float2 variable names that appear in shader code
-        let knownFloat2Vars = ["uv", "uv1", "uv2", "uv_orig", "uv6"]
+        // Start with well-known float2 variable names, then scan for locally-declared ones
+        var knownFloat2Vars = ["uv", "uv1", "uv2", "uv_orig", "uv6"]
+
+        // Scan for locally-declared float2 variables: `float2 varname`
+        let float2DeclPattern = #"(?m)\bfloat2\s+([a-zA-Z_]\w*)"#
+        if let float2DeclRegex = try? NSRegularExpression(pattern: float2DeclPattern) {
+            let nsSource = source as NSString
+            let declMatches = float2DeclRegex.matches(in: source, range: NSRange(location: 0, length: nsSource.length))
+            for m in declMatches {
+                let varName = nsSource.substring(with: m.range(at: 1))
+                if !knownFloat2Vars.contains(varName) {
+                    knownFloat2Vars.append(varName)
+                }
+            }
+        }
         // Functions that always return a scalar regardless of input vector type
         let scalarReturningFuncs = ["length", "dot", "distance", "_md_lum", "atan2"]
         let pattern = #"(?m)^(\s*float\s+\w+\s*=\s*)(.+?)\s*;\s*$"#
@@ -603,6 +717,254 @@ struct ShaderTranspiler {
             }
         }
         return false
+    }
+
+    // MARK: - Float3→Float2 Truncation
+
+    /// When a float3 variable is used in arithmetic with float2 variables,
+    /// HLSL implicitly truncates float3→float2. Metal does not.
+    /// This adds `.xy` to float3 variables in float2 assignment contexts.
+    private static func fixFloat3ToFloat2Truncation(_ source: String) -> String {
+        var lines = source.components(separatedBy: "\n")
+
+        // First pass: collect locally declared float2 and float3 variable names
+        var float2Vars: Set<String> = ["uv", "uv1", "uv2", "uv_orig", "uv6"]
+        var float3Vars: Set<String> = ["ret", "ret1", "ret2", "color", "blur", "crisp"]
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("float2 ") {
+                let rest = String(trimmed.dropFirst(7))
+                let varName = String(rest.prefix(while: { $0.isLetter || $0.isNumber || $0 == "_" }))
+                if !varName.isEmpty { float2Vars.insert(varName) }
+            }
+            if trimmed.hasPrefix("float3 ") {
+                let rest = String(trimmed.dropFirst(7))
+                let varName = String(rest.prefix(while: { $0.isLetter || $0.isNumber || $0 == "_" }))
+                if !varName.isEmpty { float3Vars.insert(varName) }
+            }
+        }
+
+        // Also treat texture sample results stored in non-typed vars as float3
+        // e.g. `noise = tex_noise_lq.sample(...)` — noise is float3 from .xyz suffix
+        // We detect `varname = tex_*.sample(` patterns
+        let sampleAssignPattern = #"(?m)^\s*(\w+)\s*=\s*tex_\w+\.sample\("#
+        if let regex = try? NSRegularExpression(pattern: sampleAssignPattern) {
+            let nsSource = source as NSString
+            let matches = regex.matches(in: source, range: NSRange(location: 0, length: nsSource.length))
+            for m in matches {
+                let varName = nsSource.substring(with: m.range(at: 1))
+                // Check the full match to see if it ends with .xyz (which makes it float3)
+                // Since our tex2D transform adds .xyz, these are float3
+                float3Vars.insert(varName)
+            }
+        }
+
+        // Second pass: for lines that assign to a float2 var (or use float2 arithmetic),
+        // truncate any float3 vars that don't already have a swizzle
+        for lineIdx in 0..<lines.count {
+            let trimmed = lines[lineIdx].trimmingCharacters(in: .whitespaces)
+
+            // Detect if this line assigns to a known float2 variable
+            var assignsToFloat2 = false
+            for f2var in float2Vars {
+                if trimmed.hasPrefix("\(f2var) =") || trimmed.hasPrefix("\(f2var)=") {
+                    assignsToFloat2 = true
+                    break
+                }
+                // Also detect `float2 varname = ...` declarations
+                if trimmed.hasPrefix("float2 ") {
+                    assignsToFloat2 = true
+                    break
+                }
+            }
+
+            guard assignsToFloat2 else { continue }
+
+            // Check if the line references any float3 vars without a swizzle
+            var line = lines[lineIdx]
+            for f3var in float3Vars {
+                // Don't truncate float3 vars that already have a swizzle
+                // Match: word boundary + varname + NOT followed by . or [
+                let pattern = "\\b\(NSRegularExpression.escapedPattern(for: f3var))\\b(?!\\s*[.\\[])"
+                guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+
+                let nsLine = line as NSString
+                let matches = regex.matches(in: line, range: NSRange(location: 0, length: nsLine.length))
+                if matches.isEmpty { continue }
+
+                // Also verify the line actually contains float2 context
+                let hasFloat2Context = float2Vars.contains(where: { name in
+                    line.range(of: "\\b\(name)\\b", options: .regularExpression) != nil
+                })
+
+                if hasFloat2Context {
+                    // Replace float3 var with var.xy (process in reverse to preserve indices)
+                    for m in matches.reversed() {
+                        let range = m.range
+                        let replacement = "\(f3var).xy"
+                        line = (line as NSString).replacingCharacters(in: range, with: replacement)
+                    }
+                }
+            }
+            lines[lineIdx] = line
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - HLSL Modulo → fmod()
+
+    /// HLSL allows `%` on float operands. Metal `%` is integer-only.
+    /// Converts `(expr) % (expr)` to `fmod(expr, expr)`.
+    /// Uses balanced-parenthesis parsing for the left operand.
+    private static func convertModuloToFmod(_ source: String) -> String {
+        // Strategy: find `%` tokens that aren't inside comments,
+        // then extract the left operand (scanning back) and right operand (scanning forward)
+        // and replace with fmod(left, float(right))
+        var lines = source.components(separatedBy: "\n")
+
+        for lineIdx in 0..<lines.count {
+            lines[lineIdx] = convertModuloInLine(lines[lineIdx])
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    /// Convert `expr % expr` → `fmod(expr, float(expr))` in a single line.
+    private static func convertModuloInLine(_ line: String) -> String {
+        let chars = Array(line.unicodeScalars)
+        guard chars.contains("%") else { return line }
+
+        var result: [Unicode.Scalar] = []
+        var i = 0
+
+        while i < chars.count {
+            if chars[i] == "%" {
+                // Make sure it's not `%=` or `%%` or inside a comment
+                let nextIdx = i + 1
+                if nextIdx < chars.count && (chars[nextIdx] == "=" || chars[nextIdx] == "%") {
+                    result.append(chars[i])
+                    i += 1
+                    continue
+                }
+
+                // Extract left operand by scanning backwards through result
+                if let (leftExpr, leftStart) = extractLeftOperand(result) {
+                    // Extract right operand by scanning forward
+                    if let (rightExpr, rightEnd) = extractRightOperand(chars, from: nextIdx) {
+                        // Replace: remove left operand from result, insert fmod(left, float(right))
+                        result.removeSubrange(leftStart..<result.count)
+                        let fmodExpr = "fmod(\(leftExpr), float(\(rightExpr)))"
+                        result.append(contentsOf: fmodExpr.unicodeScalars)
+                        i = rightEnd
+                        continue
+                    }
+                }
+
+                result.append(chars[i])
+                i += 1
+            } else {
+                result.append(chars[i])
+                i += 1
+            }
+        }
+
+        return String(String.UnicodeScalarView(result))
+    }
+
+    /// Scan backwards from the end of `scalars` to extract the left operand of `%`.
+    /// Returns the operand string and the start index in the array.
+    private static func extractLeftOperand(_ scalars: [Unicode.Scalar]) -> (String, Int)? {
+        var end = scalars.count - 1
+
+        // Skip trailing whitespace
+        while end >= 0 && (scalars[end] == " " || scalars[end] == "\t") {
+            end -= 1
+        }
+        guard end >= 0 else { return nil }
+
+        var start: Int
+
+        if scalars[end] == ")" {
+            // Balanced paren scan backwards
+            var depth = 0
+            start = end
+            while start >= 0 {
+                if scalars[start] == ")" { depth += 1 }
+                else if scalars[start] == "(" { depth -= 1 }
+                if depth == 0 { break }
+                start -= 1
+            }
+            guard start >= 0 else { return nil }
+
+            // Include any preceding function name or identifier
+            var nameStart = start - 1
+            while nameStart >= 0 && scalars[nameStart].isAlphaNumericOrUnderscore {
+                nameStart -= 1
+            }
+            start = nameStart + 1
+        } else if scalars[end].isAlphaNumericOrUnderscore || scalars[end] == "." {
+            // Simple identifier, possibly with swizzle
+            start = end
+            while start > 0 && (scalars[start - 1].isAlphaNumericOrUnderscore || scalars[start - 1] == ".") {
+                start -= 1
+            }
+        } else {
+            // Number literal
+            start = end
+            while start > 0 && (scalars[start - 1] >= "0" && scalars[start - 1] <= "9" || scalars[start - 1] == ".") {
+                start -= 1
+            }
+        }
+
+        let operand = String(String.UnicodeScalarView(Array(scalars[start...end])))
+        return (operand, start)
+    }
+
+    /// Scan forward from `from` to extract the right operand of `%`.
+    /// Returns the operand string and the index after the operand.
+    private static func extractRightOperand(_ chars: [Unicode.Scalar], from: Int) -> (String, Int)? {
+        var start = from
+
+        // Skip whitespace
+        while start < chars.count && (chars[start] == " " || chars[start] == "\t") {
+            start += 1
+        }
+        guard start < chars.count else { return nil }
+
+        var end: Int
+
+        if chars[start] == "(" {
+            // Balanced paren scan forward
+            var depth = 0
+            end = start
+            while end < chars.count {
+                if chars[end] == "(" { depth += 1 }
+                else if chars[end] == ")" { depth -= 1 }
+                if depth == 0 { break }
+                end += 1
+            }
+            guard end < chars.count else { return nil }
+            end += 1 // include closing paren
+        } else if chars[start].isAlphaNumericOrUnderscore {
+            // Identifier or number
+            end = start
+            while end < chars.count && (chars[end].isAlphaNumericOrUnderscore || chars[end] == ".") {
+                end += 1
+            }
+        } else if chars[start] == "-" || chars[start] == "+" {
+            // Unary sign + number
+            end = start + 1
+            while end < chars.count && (chars[end] >= "0" && chars[end] <= "9" || chars[end] == ".") {
+                end += 1
+            }
+        } else {
+            return nil
+        }
+
+        let operand = String(String.UnicodeScalarView(Array(chars[start..<end])))
+        return (operand, end)
     }
 
     // MARK: - Parsing Helpers
@@ -829,15 +1191,19 @@ struct ShaderTranspiler {
             float4 texsize_noisevol_lq = float4(32.0, 32.0, 1.0/32.0, 1.0/32.0);
             float4 texsize_noisevol_hq = float4(32.0, 32.0, 1.0/32.0, 1.0/32.0);
 
+            // Expose packed q-vectors (some shaders reference _qa.._qh directly)
+            float4 _qa = u._qa, _qb = u._qb, _qc = u._qc, _qd = u._qd;
+            float4 _qe = u._qe, _qf = u._qf, _qg = u._qg, _qh = u._qh;
+
             // Unpack q1..q32
-            float q1 = u._qa.x, q2 = u._qa.y, q3 = u._qa.z, q4 = u._qa.w;
-            float q5 = u._qb.x, q6 = u._qb.y, q7 = u._qb.z, q8 = u._qb.w;
-            float q9 = u._qc.x, q10 = u._qc.y, q11 = u._qc.z, q12 = u._qc.w;
-            float q13 = u._qd.x, q14 = u._qd.y, q15 = u._qd.z, q16 = u._qd.w;
-            float q17 = u._qe.x, q18 = u._qe.y, q19 = u._qe.z, q20 = u._qe.w;
-            float q21 = u._qf.x, q22 = u._qf.y, q23 = u._qf.z, q24 = u._qf.w;
-            float q25 = u._qg.x, q26 = u._qg.y, q27 = u._qg.z, q28 = u._qg.w;
-            float q29 = u._qh.x, q30 = u._qh.y, q31 = u._qh.z, q32 = u._qh.w;
+            float q1 = _qa.x, q2 = _qa.y, q3 = _qa.z, q4 = _qa.w;
+            float q5 = _qb.x, q6 = _qb.y, q7 = _qb.z, q8 = _qb.w;
+            float q9 = _qc.x, q10 = _qc.y, q11 = _qc.z, q12 = _qc.w;
+            float q13 = _qd.x, q14 = _qd.y, q15 = _qd.z, q16 = _qd.w;
+            float q17 = _qe.x, q18 = _qe.y, q19 = _qe.z, q20 = _qe.w;
+            float q21 = _qf.x, q22 = _qf.y, q23 = _qf.z, q24 = _qf.w;
+            float q25 = _qg.x, q26 = _qg.y, q27 = _qg.z, q28 = _qg.w;
+            float q29 = _qh.x, q30 = _qh.y, q31 = _qh.z, q32 = _qh.w;
 
             // UV setup from stage-in
         \(uvSetup)
