@@ -123,9 +123,12 @@ final class MeshGrid {
                     if let s = bridge.sy { vertexSy = ctx[s] }
                 }
 
-                // Zoom with exponent
-                let zoomExp = pow(max(vertexZoom, 0.001), pow(vertexZoomExp, radius * 2.0))
-                radius /= pow(zoomExp, fpsScale)
+                // Zoom with exponent — guard against zero/negative zoom or exponent producing NaN/Inf
+                let safeZoom = max(vertexZoom, 0.001)
+                let safeZoomExp = max(vertexZoomExp, 0.001)
+                let zoomExp = pow(safeZoom, pow(safeZoomExp, radius * 2.0))
+                let safeZoomExpScaled = max(pow(zoomExp, fpsScale), 1e-6)
+                radius /= safeZoomExpScaled
 
                 // Rotation: radians per frame at 30fps, scaled to actual fps
                 let rotAmount = vertexRot * fpsScale
@@ -140,13 +143,17 @@ final class MeshGrid {
                 var wu = vertexCx + radius * cos(angle) + warpX
                 var wv = vertexCy + radius * sin(angle) + warpY
 
-                // Stretch
-                wu = (wu - 0.5) / vertexSx + 0.5
-                wv = (wv - 0.5) / vertexSy + 0.5
+                // Stretch — guard against division by zero
+                wu = (wu - 0.5) / max(abs(vertexSx), 1e-6) * (vertexSx < 0 ? -1 : 1) + 0.5
+                wv = (wv - 0.5) / max(abs(vertexSy), 1e-6) * (vertexSy < 0 ? -1 : 1) + 0.5
 
                 // Translation (scaled to fps)
                 wu += vertexDx * fpsScale
                 wv += vertexDy * fpsScale
+
+                // Final NaN/Inf guard — clamp to a safe range so the sampler never sees bad values
+                if wu.isNaN || wu.isInfinite { wu = 0.5 }
+                if wv.isNaN || wv.isInfinite { wv = 0.5 }
 
                 ptr[idx] = MilkdropVertex(
                     position: SIMD3<Float>(u, v, 0),

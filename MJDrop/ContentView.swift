@@ -20,11 +20,14 @@ struct ContentView: View {
     @State private var showingShaderError = false
     @State private var shaderTestManager = ShaderTestManager()
     @State private var showingShaderTest = false
+    @AppStorage("showShaderErrors") private var showShaderErrors = false
+    @State private var isRendererPaused = false
 
     var body: some View {
         VStack(spacing: 0) {
             // Milkdrop visualizer
-            MetalVisualizerView(audioManager: audioManager, presetManager: presetManager) { errorMessage in
+            MetalVisualizerView(audioManager: audioManager, presetManager: presetManager, isRendererPaused: $isRendererPaused) { errorMessage in
+                guard showShaderErrors else { return }
                 shaderErrorMessage = errorMessage
                 showingShaderError = true
                 presetManager.stopAutoCycle()
@@ -87,19 +90,21 @@ struct ContentView: View {
                     }
 
                     // Preset controls
-                    Button(action: { presetManager.previousPreset() }) {
+                    Button(action: { presetManager.previousPreset(); isRendererPaused = false }) {
                         Image(systemName: "chevron.left")
                     }
                     .buttonStyle(.borderless)
                     .help("Previous preset")
 
-                    Button(action: { presetManager.randomPreset() }) {
+                    Toggle(isOn: $presetManager.shuffleEnabled) {
                         Image(systemName: "shuffle")
+                            .foregroundStyle(presetManager.shuffleEnabled ? .cyan : .secondary)
                     }
+                    .toggleStyle(.button)
                     .buttonStyle(.borderless)
-                    .help("Random preset")
+                    .help(presetManager.shuffleEnabled ? "Shuffle on — random preset every 10s" : "Shuffle off — sequential order")
 
-                    Button(action: { presetManager.nextPreset() }) {
+                    Button(action: { presetManager.nextPreset(); isRendererPaused = false }) {
                         Image(systemName: "chevron.right")
                     }
                     .buttonStyle(.borderless)
@@ -137,6 +142,17 @@ struct ContentView: View {
 
                     Divider().frame(height: 16)
 
+                    // Show shader errors toggle
+                    Toggle(isOn: $showShaderErrors) {
+                        Text("Shader Errors")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    .toggleStyle(.checkbox)
+                    .help("Show shader compilation errors")
+
+                    Divider().frame(height: 16)
+
                     // Audio controls
                     Button(action: { showingFilePicker = true }) {
                         Image(systemName: "folder.fill")
@@ -153,13 +169,28 @@ struct ContentView: View {
                         }
                     }
 
+                    // Pause renderer + music
+                    Button(action: {
+                        isRendererPaused.toggle()
+                        if isRendererPaused {
+                            if audioManager.isPlaying { audioManager.pause() }
+                        } else {
+                            if audioManager.fileName != nil { audioManager.togglePlayback() }
+                        }
+                    }) {
+                        Image(systemName: isRendererPaused ? "play.fill" : "pause.fill")
+                            .font(.title3)
+                    }
+                    .buttonStyle(.borderless)
+                    .help(isRendererPaused ? "Resume" : "Pause")
+
                     Button(action: { audioManager.togglePlayback() }) {
                         Image(systemName: audioManager.isPlaying ? "pause.circle.fill" : "play.circle.fill")
                             .font(.title3)
                     }
                     .buttonStyle(.borderless)
                     .disabled(audioManager.fileName == nil)
-                    .help(audioManager.isPlaying ? "Pause" : "Play")
+                    .help(audioManager.isPlaying ? "Pause music" : "Play music")
 
                     Button(action: { audioManager.stop() }) {
                         Image(systemName: "stop.circle.fill")

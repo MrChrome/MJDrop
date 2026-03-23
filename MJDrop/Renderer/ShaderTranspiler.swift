@@ -57,15 +57,40 @@ struct ShaderTranspiler {
     private static func extractShaderBody(from hlsl: String) -> String? {
         guard let bodyRange = hlsl.range(of: "shader_body") else { return nil }
 
-        // Capture pre-body variable declarations (lines before shader_body)
+        // Capture pre-body variable declarations AND function definitions before shader_body.
+        // Variable declarations are inlined into the function body.
+        // Function definitions are collected separately to be hoisted via extractHelperFunctions.
         let prebody = String(hlsl[hlsl.startIndex..<bodyRange.lowerBound])
         var preDeclarations = ""
-        for line in prebody.components(separatedBy: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            // Keep float/float2/float3/float4 variable declarations, skip sampler decls
-            if trimmed.hasPrefix("float") && trimmed.contains(";") && !trimmed.contains("sampler") {
+        let preBodyLines = prebody.components(separatedBy: "\n")
+        var pbIdx = 0
+        while pbIdx < preBodyLines.count {
+            let trimmed = preBodyLines[pbIdx].trimmingCharacters(in: .whitespaces)
+            // Collect multi-line function definitions (they will be hoisted later)
+            let funcDefPat = #"^(float[234]?|int|void|bool|half[234]?)\s+[a-zA-Z_]\w*\s*\([^)]*\)\s*\{"#
+            if trimmed.range(of: funcDefPat, options: .regularExpression) != nil {
+                // Accumulate until matching close brace
+                var funcLines = trimmed
+                var depth = trimmed.filter({ $0 == "{" }).count - trimmed.filter({ $0 == "}" }).count
+                pbIdx += 1
+                while depth > 0 && pbIdx < preBodyLines.count {
+                    let l = preBodyLines[pbIdx].trimmingCharacters(in: .whitespaces)
+                    funcLines += "\n" + l
+                    depth += l.filter({ $0 == "{" }).count - l.filter({ $0 == "}" }).count
+                    pbIdx += 1
+                }
+                preDeclarations += funcLines + "\n"
+                continue
+            }
+            // Keep `#define` macros — often used to alias functions (e.g. `#define MyGet GetPixel`)
+            if trimmed.hasPrefix("#define") {
                 preDeclarations += trimmed + "\n"
             }
+            // Keep float/float2/float3/float4 variable declarations, skip sampler decls
+            else if trimmed.hasPrefix("float") && trimmed.contains(";") && !trimmed.contains("sampler") {
+                preDeclarations += trimmed + "\n"
+            }
+            pbIdx += 1
         }
 
         let afterBody = hlsl[bodyRange.upperBound...]
@@ -101,6 +126,86 @@ struct ShaderTranspiler {
         s = s.replacingOccurrences(
             of: #"(?m)^\s*sampler\s+sampler_\w+\s*;\s*$"#,
             with: "",
+            options: .regularExpression
+        )
+
+        // tex2d (lowercase) → tex2D
+        s = s.replacingOccurrences(
+            of: #"\btex2d\b"#,
+            with: "tex2D",
+            options: .regularExpression
+        )
+
+        // slow_roam_cos / slow_roam_sin → roam_cos / roam_sin
+        s = s.replacingOccurrences(of: #"\bslow_roam_cos\b"#, with: "roam_cos", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"\bslow_roam_sin\b"#, with: "roam_sin", options: .regularExpression)
+
+        // hue_shader — undeclared float3 variable some presets reference but never define
+        // Insert a declaration if used but not declared
+        if s.range(of: #"\bhue_shader\b"#, options: .regularExpression) != nil &&
+           s.range(of: #"float[234]?\s+hue_shader\b"#, options: .regularExpression) == nil {
+            s = "float3 hue_shader = float3(1.0);\n" + s
+        }
+
+        // M_INV_PI_2 → 1/(2*pi)
+        s = s.replacingOccurrences(of: #"\bM_INV_PI_2\b"#, with: "(1.0/(2.0*3.14159265))", options: .regularExpression)
+
+        // M_PI_2 → pi/2
+        s = s.replacingOccurrences(of: #"\bM_PI_2\b"#, with: "(3.14159265/2.0)", options: .regularExpression)
+
+        // Undeclared variable `anz` (typo for `ang` in some presets) — declare it
+        if s.range(of: #"\banz\b"#, options: .regularExpression) != nil &&
+           s.range(of: #"float[234]?\s+anz\b"#, options: .regularExpression) == nil {
+            s = "float anz = 0.0;\n" + s
+        }
+
+        // `vol` — used in some presets as a local average-volume variable.
+        // If used but not declared, insert a declaration at the top of the body.
+        if s.range(of: #"\bvol\b"#, options: .regularExpression) != nil &&
+           s.range(of: #"float[234]?\s+vol\b"#, options: .regularExpression) == nil {
+            s = "float vol = (bass + mid + treb) * 0.333333;\n" + s
+        }
+
+        // `uv2` — some presets use a second UV coordinate that isn't declared.
+        if s.range(of: #"\buv2\b"#, options: .regularExpression) != nil &&
+           s.range(of: #"float[234]?\s+uv2\b"#, options: .regularExpression) == nil {
+            s = "float2 uv2 = uv;\n" + s
+        }
+
+        // `blur1_min`, `blur1_max`, `blur2_min`, `blur2_max`, `blur3_min`, `blur3_max`
+        // — blur range uniforms that some presets reference. Provide safe defaults if missing.
+        for blurVar in ["blur1_min", "blur1_max", "blur2_min", "blur2_max", "blur3_min", "blur3_max"] {
+            if s.range(of: "\\b\(blurVar)\\b", options: .regularExpression) != nil &&
+               s.range(of: "float[234]?\\s+\(blurVar)\\b", options: .regularExpression) == nil {
+                let defaultVal = blurVar.hasSuffix("_min") ? "0.0" : "1.0"
+                s = "float \(blurVar) = \(defaultVal);\n" + s
+            }
+        }
+
+        // `sw2` — undefined float used in some presets, likely a wave switch variable. Default to 0.
+        if s.range(of: #"\bsw2\b"#, options: .regularExpression) != nil &&
+           s.range(of: #"float[234]?\s+sw2\b"#, options: .regularExpression) == nil {
+            s = "float sw2 = 0.0;\n" + s
+        }
+
+        // `trel` (typo for `treb`) — remap to treb
+        s = s.replacingOccurrences(of: #"\btrel\b"#, with: "treb", options: .regularExpression)
+
+        // `while expr` without parens — HLSL allows `while expr`, Metal requires `while (expr)`.
+        // Add parens around while conditions that are missing them.
+        s = s.replacingOccurrences(
+            of: #"\bwhile\s+(?!\s*\()"#,
+            with: "while (",
+            options: .regularExpression
+        )
+        s = fixWhileMissingCloseParen(s)
+
+        // `_md_lum.xxx` — `_md_lum` is a function, not a variable. Some presets write
+        // `_md_lum.xxx` meaning "luminance as a float3". Replace with `float3(_md_lum(ret))`.
+        // Pattern: `_md_lum.` not followed by `(`
+        s = s.replacingOccurrences(
+            of: #"\b_md_lum\.([xyzwrgba]+)\b"#,
+            with: "_md_lum(ret).$1",
             options: .regularExpression
         )
 
@@ -215,7 +320,20 @@ struct ShaderTranspiler {
         // Fix variable redefinitions: when a variable is declared in pre-body
         // (e.g. `float3 neu, ret1;`) and then re-declared in body
         // (e.g. `float3 ret1 = 0;`), convert the second to an assignment.
+        // Also removes re-declarations of preamble uniforms (decay, time, etc.)
         s = fixVariableRedefinitions(s)
+
+        // Fix for loops where the counter variable is undeclared: `for (n=0; n<4; n++)`
+        // Insert `int n;` before the for loop if `n` is not already declared.
+        s = fixUndeclaredForLoopVars(s)
+
+        // Fix `clamp(expr, int, int)` — Metal's clamp is overloaded and ambiguous
+        // with integer literals. Cast integer literal args to float.
+        s = fixClampIntLiterals(s)
+
+        // Fix `(float_expr).x` — accessing .x on a scalar is illegal in Metal.
+        // Pattern: `(something).x` where `something` produces a float.
+        s = fixRedundantScalarSwizzle(s)
 
         // Handle HLSL implicit truncation for known float4 uniforms used as scalars.
         // When these appear in arithmetic without a swizzle, HLSL auto-truncates.
@@ -424,8 +542,19 @@ struct ShaderTranspiler {
     /// This pass tracks declared variable names and converts re-declarations to assignments.
     private static func fixVariableRedefinitions(_ source: String) -> String {
         var lines = source.components(separatedBy: "\n")
-        // Track all declared variable names and their types
-        var declaredVars: [String: String] = [:]  // varName -> type
+        // Pre-seed with variables declared in the Metal preamble so user shaders
+        // that re-declare them (e.g. `float decay = ...;`) get converted to assignments.
+        var declaredVars: [String: String] = [
+            "time": "float", "fps": "float", "frame": "float",
+            "bass": "float", "mid": "float", "treb": "float",
+            "bass_att": "float", "mid_att": "float", "treb_att": "float",
+            "decay": "float", "aspect": "float4", "texsize": "float4",
+            "rand_frame": "float4", "rand_preset": "float4",
+            "roam_cos": "float4", "roam_sin": "float4",
+            "uv": "float2", "uv_orig": "float2",
+            "rad": "float", "ang": "float",
+            "ret": "float3",
+        ]
 
         // Pattern to match declarations: `float3 varname` or `float2 a, b, c;`
         let declPattern = #"(?m)^\s*(float[234]?|int|bool)\s+(.+?)\s*;"#
@@ -513,6 +642,19 @@ struct ShaderTranspiler {
             with: "texsize.x * texsize_$1.z",
             options: .regularExpression
         )
+
+        // 4a. Fix `_md_GetBlur1/2/3(...)` and `_md_GetPixel(...)` used as scalars.
+        //     These macros return float3 but HLSL presets routinely use them as floats.
+        //     Add `.x` to any call not already followed by a dot-swizzle, UNLESS the call
+        //     is the sole RHS of a direct `identifier = _md_Get...(args)` assignment.
+        s = fixBlurMacrosInScalarContext(s)
+
+        // 4b. Fix `ret.x = vector_expr` — scalar component assignment from a vector.
+        //     Metal doesn't implicitly truncate float4/float3 to a component scalar.
+        //     Transform: `ret.x = expr.xyz` → `ret.x = expr.x`
+        //                `ret.x = tex.sample(...).xyz` → `ret.x = tex.sample(...).x`
+        //                `ret.x = tex.sample(...)` → `ret.x = tex.sample(...).x`
+        s = fixComponentAssignmentFromVector(s)
 
         // 4. Fix scalar assignments from vector expressions.
         s = fixScalarAssignments(s)
@@ -681,9 +823,211 @@ struct ShaderTranspiler {
     /// Detects lines like `float x = sin((uv1-q12)*q27);` where the RHS
     /// likely returns a vector type (because it operates on known float2/float3/float4 variables)
     /// and the LHS is a scalar `float`. Appends `.x` to the RHS expression.
+    /// Fix `_md_GetBlur1/2/3(...)` and `_md_GetPixel(...)` calls used in scalar context.
+    /// These macros return `float3` (via `.xyz` expansion), but HLSL presets use them as
+    /// scalars frequently (e.g., `ret.x += (ret.x - _md_GetBlur3(uv)) * 0.1`).
+    /// We add `.x` to any call not already followed by a dot-swizzle, UNLESS the call
+    /// is the sole expression on the RHS of a plain `=` assignment.
+    private static func fixBlurMacrosInScalarContext(_ source: String) -> String {
+        let macroNames = ["_md_GetBlur1", "_md_GetBlur2", "_md_GetBlur3", "_md_GetPixel"]
+        var result = source
+        let chars = Array(result)
+        let n = chars.count
+        var insertions: [(offset: Int, str: String)] = []  // (index after ), ".x")
+
+        // Pre-compute which character offsets are on #define / #undef lines (skip those)
+        var onDefLine = [Bool](repeating: false, count: n)
+        var lineStart = 0
+        for pos in 0..<n {
+            if chars[pos] == "\n" { lineStart = pos + 1 }
+            // Check if current line starts with optional whitespace then #define or #undef
+            var ls = lineStart
+            while ls < pos && (chars[ls] == " " || chars[ls] == "\t") { ls += 1 }
+            if ls + 7 <= n && String(chars[ls..<(ls+7)]) == "#define" { onDefLine[pos] = true }
+            else if ls + 6 <= n && String(chars[ls..<(ls+6)]) == "#undef" { onDefLine[pos] = true }
+        }
+
+        var i = 0
+        while i < n {
+            // Skip #define / #undef lines entirely
+            if onDefLine[i] { i += 1; continue }
+
+            // Try to match any macro name at position i
+            var matched: String? = nil
+            for name in macroNames {
+                let nameChars = Array(name)
+                let nameLen = nameChars.count
+                if i + nameLen <= n {
+                    let slice = chars[i..<(i + nameLen)]
+                    if slice.elementsEqual(nameChars) {
+                        // Make sure it's not preceded by an identifier char (avoid matching inside longer names)
+                        if i > 0 && (chars[i-1].isLetter || chars[i-1].isNumber || chars[i-1] == "_") {
+                            break
+                        }
+                        matched = name
+                        break
+                    }
+                }
+            }
+            guard let macroName = matched else { i += 1; continue }
+
+            let macroStart = i
+            i += macroName.count
+            // Skip whitespace before (
+            while i < n && chars[i] == " " { i += 1 }
+            guard i < n && chars[i] == "(" else { continue }
+
+            // Find the matching close paren (paren-depth tracking)
+            var depth = 1
+            i += 1  // skip (
+            while i < n && depth > 0 {
+                if chars[i] == "(" { depth += 1 }
+                else if chars[i] == ")" { depth -= 1 }
+                i += 1
+            }
+            // i is now the index AFTER the closing )
+            let callEnd = i  // index right after the closing paren of the macro call
+
+            // Check what follows the call:
+            // If already followed by `.` (swizzle) → skip
+            var peekIdx = callEnd
+            while peekIdx < n && chars[peekIdx] == " " { peekIdx += 1 }
+            if peekIdx < n && chars[peekIdx] == "." {
+                // Already has a swizzle — check if it's a valid component or named swizzle
+                // e.g. `.x`, `.xyz`, `.r` → skip
+                continue
+            }
+
+            // Check: is this call the SOLE RHS of a direct assignment to a float3 target?
+            // Pattern: `float3 var = _md_GetBlurN(...)` or `ret = _md_GetBlurN(...)`
+            // Only skip if the LHS is clearly a float3 (don't skip for float/float2 LHS).
+            var prevIdx = macroStart - 1
+            while prevIdx >= 0 && (chars[prevIdx] == " " || chars[prevIdx] == "\t") { prevIdx -= 1 }
+            let skipForFloat3: Bool
+            if prevIdx >= 0 && chars[prevIdx] == "=" {
+                // Check it's not `+=`, `-=`, `*=`, `/=`
+                let prevPrev = prevIdx - 1
+                if prevPrev >= 0 && "+-*/!<>".contains(chars[prevPrev]) {
+                    skipForFloat3 = false
+                } else {
+                    // It IS a plain `= macro(...)` — check that the call is sole on RHS
+                    var ahead = callEnd
+                    while ahead < n && (chars[ahead] == " " || chars[ahead] == "\t") { ahead += 1 }
+                    let isSoleRhs = ahead >= n || chars[ahead] == ";" || chars[ahead] == "\n" || chars[ahead] == "\r"
+                    if isSoleRhs {
+                        // Now check: is the LHS a float3 declaration or a known float3 variable?
+                        // Walk left from the `=` to find the LHS token
+                        var lhsEnd = prevIdx - 1
+                        while lhsEnd >= 0 && (chars[lhsEnd] == " " || chars[lhsEnd] == "\t") { lhsEnd -= 1 }
+                        var lhsStart = lhsEnd
+                        while lhsStart > 0 && (chars[lhsStart-1].isLetter || chars[lhsStart-1].isNumber || chars[lhsStart-1] == "_") { lhsStart -= 1 }
+                        let lhsVarName = String(chars[lhsStart...lhsEnd])
+                        // Check for `float3 varname =` — look further left for "float3"
+                        var typeEnd = lhsStart - 1
+                        while typeEnd >= 0 && (chars[typeEnd] == " " || chars[typeEnd] == "\t") { typeEnd -= 1 }
+                        var typeStart = typeEnd
+                        while typeStart > 0 && (chars[typeStart-1].isLetter || chars[typeStart-1].isNumber || chars[typeStart-1] == "_") { typeStart -= 1 }
+                        let typeName = typeStart <= typeEnd ? String(chars[typeStart...typeEnd]) : ""
+                        // Known float3 variables that receive blur results without truncation
+                        let float3Vars: Set<String> = ["ret", "ret1", "ret2", "color", "bloom", "col", "c", "c2", "c3", "rgb", "hsv", "n", "glow"]
+                        skipForFloat3 = typeName == "float3" || float3Vars.contains(lhsVarName)
+                    } else {
+                        skipForFloat3 = false
+                    }
+                }
+            } else {
+                skipForFloat3 = false
+            }
+
+            if !skipForFloat3 {
+                // Record insertion of ".x" at callEnd
+                insertions.append((offset: callEnd, str: ".x"))
+            }
+
+            // i already advanced past the call, continue
+        }
+
+        // Apply insertions in reverse order so offsets stay valid
+        if insertions.isEmpty { return result }
+        for ins in insertions.reversed() {
+            let idx = result.index(result.startIndex, offsetBy: ins.offset)
+            result.insert(contentsOf: ins.str, at: idx)
+        }
+        return result
+    }
+
     ///
     /// Smart enough to skip cases where the float2 var is inside a scalar-returning function
     /// like `length()`, `dot()`, `distance()`, etc.
+    /// Fix `scalar_lhs = vector_expr` where `scalar_lhs` is a single-component member like `ret.x`.
+    /// Metal doesn't implicit-truncate float4/float3 → float. We add `.x` to the RHS.
+    /// Also handles `ret.x += vector_expr` and similar compound assignments.
+    private static func fixComponentAssignmentFromVector(_ source: String) -> String {
+        var lines = source.components(separatedBy: "\n")
+
+        // Pattern: `<expr>.<single_component> [+|-|*|/]?= <rhs>;`
+        // where <single_component> is x, y, z, w, r, g, b, a
+        // and <rhs> ends with `.xyz`, `.xy`, `.xyzw`, or is a bare `.sample()` call (no swizzle)
+        for i in 0..<lines.count {
+            let line = lines[i]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            // Skip comment lines
+            if trimmed.hasPrefix("//") { continue }
+
+            // Look for patterns like: `someVar.x = ` or `someVar.x += ` etc.
+            // Using a regex to find the assignment operator position
+            guard let assignRange = line.range(of: #"\.[xyzwrgba]\s*[\+\-\*\/]?="#, options: .regularExpression) else { continue }
+
+            // Verify the char before the swizzle is an identifier character (word char)
+            let dotIdx = assignRange.lowerBound
+            if dotIdx > line.startIndex {
+                let prevIdx = line.index(before: dotIdx)
+                let prevChar = line[prevIdx]
+                guard prevChar.isLetter || prevChar.isNumber || prevChar == "_" else { continue }
+            }
+
+            // Extract the RHS (after the `=` sign)
+            guard let eqPos = line.range(of: "=", range: assignRange) else { continue }
+            let rhsStart = line.index(after: eqPos.lowerBound)
+            // Skip leading whitespace
+            var rhsBegin = rhsStart
+            while rhsBegin < line.endIndex && line[rhsBegin] == " " { rhsBegin = line.index(after: rhsBegin) }
+            let rhs = String(line[rhsBegin...]).trimmingCharacters(in: CharacterSet(charactersIn: ";").union(.whitespaces))
+
+            // Check if RHS is a vector expression that needs truncation.
+            // Conditions to apply fix:
+            // 1. RHS ends with `.xyz`, `.xyzw`, `.xy` (multi-component swizzle on vector) — change to `.x`
+            // 2. RHS ends with a texture .sample(...) call with no swizzle — add `.x`
+            // 3. RHS ends with blur/pixel function result (returns float3) — add `.x`
+
+            let multiSwizzles = [".xyz", ".xyzw", ".xy", ".yzw", ".zw"]
+            if multiSwizzles.contains(where: { rhs.hasSuffix($0) }) {
+                // Replace the multi-component swizzle with `.x`
+                let dotIdx2 = rhs.lastIndex(of: ".")!
+                let newRhs = String(rhs[..<dotIdx2]) + ".x"
+                let newLine = String(line[..<rhsBegin]) + newRhs + ";"
+                lines[i] = newLine
+                continue
+            }
+
+            // Check if RHS ends with a tex/blur sample call (float4) or blur (float3) without any swizzle
+            let endsWithSample = rhs.hasSuffix(")") || rhs.hasSuffix(", 0)") // loose check
+            if endsWithSample {
+                // More specific check: does the expression contain .sample( or _md_GetBlur or _md_GetPixel?
+                let isVectorReturn = rhs.contains(".sample(") || rhs.contains("_md_GetBlur") ||
+                                     rhs.contains("_md_GetPixel") || rhs.contains("tex2D(") ||
+                                     rhs.contains("tex3D(")
+                if isVectorReturn {
+                    let newLine = String(line[..<rhsBegin]) + rhs + ".x;"
+                    lines[i] = newLine
+                    continue
+                }
+            }
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
     private static func fixScalarAssignments(_ source: String) -> String {
         // Start with well-known float2 variable names, then scan for locally-declared ones
         var knownFloat2Vars = ["uv", "uv1", "uv2", "uv_orig", "uv6"]
@@ -700,8 +1044,11 @@ struct ShaderTranspiler {
                 }
             }
         }
-        // Functions that always return a scalar regardless of input vector type
-        let scalarReturningFuncs = ["length", "dot", "distance", "_md_lum", "atan2"]
+        // Functions that accept float2 UV args but whose result is not a float2.
+        // When a float2 var appears inside these, it's used as a UV coord (scalar-safe context).
+        let scalarReturningFuncs = ["length", "dot", "distance", "_md_lum", "atan2",
+                                    "_md_GetBlur1", "_md_GetBlur2", "_md_GetBlur3",
+                                    "_md_GetPixel", "tex2D", "tex3D", "sample"]
         let pattern = #"(?m)^(\s*float\s+\w+\s*=\s*)(.+?)\s*;\s*$"#
 
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return source }
@@ -715,7 +1062,15 @@ struct ShaderTranspiler {
             let rhsRange = match.range(at: 2)
             let rhs = nsSource.substring(with: rhsRange)
 
-            // Check if RHS contains a known float2 variable (indicating vector result)
+            // If the RHS already ends with a scalar swizzle (.x, .y, .z, .w etc.),
+            // the result is already scalar — no wrapping needed.
+            let trimmedRhs = rhs.trimmingCharacters(in: .whitespaces)
+            let scalarSuffixes = [".x", ".y", ".z", ".w", ".r", ".g", ".b", ".a"]
+            if scalarSuffixes.contains(where: { trimmedRhs.hasSuffix($0) }) {
+                continue
+            }
+
+            // Check if RHS contains a known float2 variable (indicating possible vector result)
             let containsVector = knownFloat2Vars.contains { name in
                 rhs.range(of: "\\b\(name)\\b", options: .regularExpression) != nil
             }
@@ -1185,6 +1540,262 @@ struct ShaderTranspiler {
         return nil
     }
 
+    // MARK: - while Missing Close Paren Fix
+
+    /// After we prepend `while (` for HLSL `while condition` patterns (no parens),
+    /// we need to find the end of the condition and insert the closing `)`.
+    /// The condition ends just before the `{` that opens the loop body, or at end-of-line
+    /// if the opening brace is on the next line.
+    private static func fixWhileMissingCloseParen(_ source: String) -> String {
+        var lines = source.components(separatedBy: "\n")
+        for i in 0..<lines.count {
+            var line = lines[i]
+            // Only process lines we modified — they now contain `while (`
+            // but the `(` we inserted for the condition may not be balanced.
+            guard let whileRange = line.range(of: "while (") else { continue }
+
+            // Count parens starting after the `(` we inserted.
+            let start = whileRange.upperBound  // character after `while (`
+            var depth = 1  // we opened one `(` for the condition
+            var idx = start
+            var insertionPoint: String.Index? = nil
+
+            while idx < line.endIndex {
+                let ch = line[idx]
+                if ch == "(" {
+                    depth += 1
+                } else if ch == ")" {
+                    depth -= 1
+                    if depth == 0 {
+                        // The condition is already closed — nothing to do.
+                        insertionPoint = nil
+                        break
+                    }
+                } else if ch == "{" {
+                    // Hit the body-open brace; insert `)` before it (and any preceding spaces)
+                    var closeAt = idx
+                    while closeAt > start {
+                        let prev = line.index(before: closeAt)
+                        if line[prev] == " " || line[prev] == "\t" {
+                            closeAt = prev
+                        } else {
+                            break
+                        }
+                    }
+                    insertionPoint = closeAt
+                    break
+                }
+                idx = line.index(after: idx)
+            }
+
+            if let pos = insertionPoint {
+                line.insert(")", at: pos)
+                lines[i] = line
+            } else if depth > 0 {
+                // No `{` found on this line and paren not closed — append `)` at end of line
+                line += ")"
+                lines[i] = line
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - For Loop Variable Fix
+
+    /// `for (n=0; n<4; n++)` without `int n` declared → insert `int n = 0;` before the loop.
+    private static func fixUndeclaredForLoopVars(_ source: String) -> String {
+        // Find all `for (` loops where the init is an assignment without a type
+        let forPattern = #"\bfor\s*\(\s*([a-zA-Z_]\w*)\s*="#
+        guard let regex = try? NSRegularExpression(pattern: forPattern) else { return source }
+        var lines = source.components(separatedBy: "\n")
+        var declared: Set<String> = []
+
+        // Collect already-declared vars
+        let declPat = #"\b(float[234]?|int|bool)\s+([a-zA-Z_]\w*)"#
+        if let declRegex = try? NSRegularExpression(pattern: declPat) {
+            for line in lines {
+                let ns = line as NSString
+                for m in declRegex.matches(in: line, range: NSRange(location: 0, length: ns.length)) {
+                    declared.insert(ns.substring(with: m.range(at: 2)))
+                }
+            }
+        }
+
+        var insertions: [(index: Int, decl: String)] = []
+        for (lineIdx, line) in lines.enumerated() {
+            let ns = line as NSString
+            for m in regex.matches(in: line, range: NSRange(location: 0, length: ns.length)) {
+                let varName = ns.substring(with: m.range(at: 1))
+                if !declared.contains(varName) {
+                    insertions.append((lineIdx, "int \(varName) = 0;"))
+                    declared.insert(varName)
+                }
+            }
+        }
+        // Insert in reverse so indices stay valid
+        for ins in insertions.sorted(by: { $0.index > $1.index }) {
+            lines.insert(ins.decl, at: ins.index)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - Clamp Int Literal Fix
+
+    /// `clamp(expr, -6, 0)` — Metal's `clamp` is ambiguous when mixing float expr with int literals.
+    /// Cast bare integer literals in 2nd and 3rd args to float.
+    private static func fixClampIntLiterals(_ source: String) -> String {
+        // Match clamp( ... , intLiteral, intLiteral ) where intLiteral is [-]digits with no `.`
+        let pattern = #"\bclamp\s*\(([^,]+),\s*(-?\d+)\s*,\s*(-?\d+)\s*\)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return source }
+        let ns = source as NSString
+        var result = source
+        var offset = 0
+        for m in regex.matches(in: source, range: NSRange(location: 0, length: ns.length)) {
+            let fullRange = Range(m.range, in: result)!
+            let exprRange = Range(m.range(at: 1), in: source)!
+            let lo = ns.substring(with: m.range(at: 2))
+            let hi = ns.substring(with: m.range(at: 3))
+            let expr = String(source[exprRange])
+            let replacement = "clamp(\(expr), \(lo).0, \(hi).0)"
+            let adjustedRange = result.index(result.startIndex, offsetBy: result.distance(from: result.startIndex, to: fullRange.lowerBound) + offset)..<result.index(result.startIndex, offsetBy: result.distance(from: result.startIndex, to: fullRange.upperBound) + offset)
+            result.replaceSubrange(adjustedRange, with: replacement)
+            offset += replacement.count - result.distance(from: fullRange.lowerBound, to: fullRange.upperBound)
+        }
+        return result
+    }
+
+    // MARK: - Redundant Scalar Swizzle Fix
+
+    /// `(float_expr).x` where `float_expr` already produces a scalar — removes the `.x`.
+    /// Metal doesn't allow swizzling a scalar. This iteratively strips `.COMPONENT` suffixes
+    /// from parenthesized expressions that already evaluate to a scalar (all sub-expressions
+    /// have a single-component swizzle or are multiplied/divided scalars).
+    private static func fixRedundantScalarSwizzle(_ source: String) -> String {
+        var s = source
+        // Repeatedly apply until no more changes (handles nested cases)
+        var prev = ""
+        while prev != s {
+            prev = s
+            // Pattern: `(expr).X` where X is a single letter swizzle component (x,y,z,w,r,g,b,a)
+            // AND every leaf in expr ends with a single-component swizzle.
+            // Heuristic: scan for `).x` / `).y` etc and check if the balanced-paren group
+            // only contains scalars (no bare vec constructors or unswizzled vec results).
+            s = stripScalarSwizzleOnParens(s)
+        }
+        return s
+    }
+
+    private static func stripScalarSwizzleOnParens(_ source: String) -> String {
+        var result = ""
+        let chars = Array(source)
+        var i = 0
+        while i < chars.count {
+            // Look for `)` followed by `.` followed by single component letter
+            if chars[i] == ")" && i + 2 < chars.count && chars[i+1] == "." {
+                let comp = chars[i+2]
+                let singleComponents: Set<Character> = ["x","y","z","w","r","g","b","a"]
+                let notFollowedByAlnum = (i + 3 >= chars.count) || !chars[i+3].isLetter && !chars[i+3].isNumber && chars[i+3] != "_"
+                if singleComponents.contains(comp) && notFollowedByAlnum {
+                    // Find the matching open paren for this `)`
+                    var depth = 1
+                    var j = i - 1
+                    while j >= 0 && depth > 0 {
+                        if chars[j] == ")" { depth += 1 }
+                        else if chars[j] == "(" { depth -= 1 }
+                        if depth > 0 { j -= 1 }
+                    }
+                    if j >= 0 {
+                        // Extract the content between ( and )
+                        let inner = String(chars[(j+1)..<i])
+                        // Check if the inner expression is scalar-valued:
+                        // It's scalar if ALL texture/blur samples have a single-component swizzle,
+                        // and there are no bare float2/float3 constructors or vec variables.
+                        if isScalarExpression(inner) {
+                            // Remove the `.X` suffix — skip i, i+1, i+2
+                            result.append(")")
+                            i += 3 // skip ), ., component
+                            continue
+                        }
+                    }
+                }
+            }
+            result.append(chars[i])
+            i += 1
+        }
+        return result
+    }
+
+    /// Returns true if the expression is likely scalar-valued (not a vector).
+    ///
+    /// Approach: walk at the top nesting level (depth == 0).
+    /// At depth 0, every `)` that ends a sub-expression must be followed by a single-component
+    /// swizzle (`.x`, `.y`, etc.) to be considered scalar. A `)` without `.X` means an
+    /// unswizzled function/paren result — which could be a vector.
+    ///
+    /// To avoid false-negatives from `)` inside function *arguments* (e.g. `float2(d,0)` inside
+    /// `GetBlur2(...)`), we only examine `)` chars that are at the *outermost* paren depth.
+    private static func isScalarExpression(_ expr: String) -> Bool {
+        let trimmed = expr.trimmingCharacters(in: .whitespaces)
+        let chars = Array(trimmed)
+        let n = chars.count
+        var depth = 0
+        let singleComponents: Set<Character> = ["x","y","z","w","r","g","b","a"]
+        let vecTypes: Set<String> = ["float2", "float3", "float4", "half2", "half3", "half4",
+                                     "int2", "int3", "int4"]
+
+        var i = 0
+        while i < n {
+            let ch = chars[i]
+            if ch == "(" {
+                // Before incrementing depth, check if this is a vector constructor at depth 0
+                if depth == 0 {
+                    // Look at the word immediately before this `(`
+                    var j = i - 1
+                    while j >= 0 && (chars[j] == " " || chars[j] == "\t") { j -= 1 }
+                    if j >= 0 && (chars[j].isLetter || chars[j].isNumber || chars[j] == "_") {
+                        var k = j
+                        while k > 0 && (chars[k-1].isLetter || chars[k-1].isNumber || chars[k-1] == "_") { k -= 1 }
+                        let word = String(chars[k...j])
+                        if vecTypes.contains(word) {
+                            return false  // vector constructor at top level
+                        }
+                    }
+                }
+                depth += 1
+            } else if ch == ")" {
+                depth -= 1
+                // Only examine closes at the outermost level
+                if depth == 0 {
+                    let next = i + 1
+                    if next < n && chars[next] == "." {
+                        let compIdx = next + 1
+                        if compIdx < n {
+                            let c = chars[compIdx]
+                            let afterComp = compIdx + 1
+                            let nextIsAlnum = afterComp < n &&
+                                (chars[afterComp].isLetter || chars[afterComp].isNumber || chars[afterComp] == "_")
+                            if singleComponents.contains(c) && !nextIsAlnum {
+                                // single-component swizzle → scalar ✓
+                                i = compIdx + 1
+                                continue
+                            } else {
+                                // .xyz or .sample or other member — vector ✗
+                                return false
+                            }
+                        }
+                    } else {
+                        // `)` at depth 0 without following `.X`.
+                        // This could be an unswizzled vector return (e.g. `tex_main.sample(...)`) 
+                        // — treat as non-scalar to be safe.
+                        return false
+                    }
+                }
+            }
+            i += 1
+        }
+        return true
+    }
+
     // MARK: - Metal Source Generation
 
     // MARK: - Helper Function → Macro Conversion
@@ -1392,6 +2003,12 @@ struct ShaderTranspiler {
         static float3 _md_f3(float2 v) { return float3(v, 0); }
         static float3 _md_f3(float3 v) { return v; }
         static float3 _md_f3(float v) { return float3(v); }
+
+        // HLSL cross() allows scalar promotion for either argument; MSL requires float3+float3
+        static float3 cross(float3 a, float b) { return cross(a, float3(b)); }
+        static float3 cross(float b, float3 a) { return cross(float3(b), a); }
+        static float3 cross(float3 a, float2 b) { return cross(a, float3(b, 0)); }
+        static float3 cross(float2 b, float3 a) { return cross(float3(b, 0), a); }
 
         fragment float4 \(functionName)(
             \(stageInType) _in [[stage_in]],

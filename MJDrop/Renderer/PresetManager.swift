@@ -18,6 +18,7 @@ final class PresetManager {
     private(set) var currentIndex: Int = 0
     private(set) var presetDirectory: URL?
     private(set) var isLoadingDirectory: Bool = false
+    var shuffleEnabled: Bool = false
 
     private var cycleTimer: Timer?
 
@@ -40,7 +41,12 @@ final class PresetManager {
         stopAutoCycle()
         cycleTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.randomPreset()
+                guard let self else { return }
+                if self.shuffleEnabled {
+                    self.randomPreset()
+                } else {
+                    self.nextPreset()
+                }
             }
         }
     }

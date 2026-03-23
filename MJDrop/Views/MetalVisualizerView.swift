@@ -12,6 +12,7 @@ import MetalKit
 struct MetalVisualizerView: NSViewRepresentable {
     let audioManager: AudioPlayerManager
     let presetManager: PresetManager
+    @Binding var isRendererPaused: Bool
     var onShaderError: ((String) -> Void)?
 
     func makeCoordinator() -> Coordinator {
@@ -42,7 +43,7 @@ struct MetalVisualizerView: NSViewRepresentable {
             // Wire shader error callback
             renderer.onShaderError = { [weak mtkView] message in
                 mtkView?.isPaused = true
-                self.audioManager.pause()
+                self.isRendererPaused = true
                 self.onShaderError?(message)
             }
         } catch {
@@ -55,6 +56,9 @@ struct MetalVisualizerView: NSViewRepresentable {
     func updateNSView(_ nsView: MTKView, context: Context) {
         guard let renderer = context.coordinator.renderer else { return }
 
+        // Sync renderer pause state
+        nsView.isPaused = isRendererPaused
+
         // Forward audio data
         renderer.fftMagnitudes = audioManager.fftMagnitudes
         renderer.waveformSamples = audioManager.waveformSamples
@@ -63,8 +67,6 @@ struct MetalVisualizerView: NSViewRepresentable {
         let currentPreset = presetManager.currentPreset
         if currentPreset.name != context.coordinator.lastPresetName {
             context.coordinator.lastPresetName = currentPreset.name
-            // Resume rendering if it was paused from a previous error
-            nsView.isPaused = false
             renderer.loadPreset(currentPreset)
         }
     }
