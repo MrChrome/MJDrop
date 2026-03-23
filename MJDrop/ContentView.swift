@@ -18,6 +18,8 @@ struct ContentView: View {
     @State private var presetSearchText = ""
     @State private var shaderErrorMessage: String?
     @State private var showingShaderError = false
+    @State private var shaderTestManager = ShaderTestManager()
+    @State private var showingShaderTest = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -25,6 +27,7 @@ struct ContentView: View {
             MetalVisualizerView(audioManager: audioManager, presetManager: presetManager) { errorMessage in
                 shaderErrorMessage = errorMessage
                 showingShaderError = true
+                presetManager.stopAutoCycle()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -120,6 +123,18 @@ struct ContentView: View {
                         }
                     }
 
+                    // Test all shaders
+                    Button(action: {
+                        showingShaderTest = true
+                        presetManager.stopAutoCycle()
+                        shaderTestManager.runTests(presets: presetManager.presets)
+                    }) {
+                        Image(systemName: "testtube.2")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(presetManager.isLoadingDirectory || shaderTestManager.isRunning)
+                    .help("Test all shader compilation (\(presetManager.presetCount) presets)")
+
                     Divider().frame(height: 16)
 
                     // Audio controls
@@ -168,6 +183,13 @@ struct ContentView: View {
         .sheet(isPresented: $showingShaderError) {
             ShaderErrorView(errorMessage: shaderErrorMessage ?? "Unknown error") {
                 showingShaderError = false
+                presetManager.startAutoCycle()
+            }
+        }
+        .sheet(isPresented: $showingShaderTest) {
+            ShaderTestReportView(testManager: shaderTestManager) {
+                showingShaderTest = false
+                presetManager.startAutoCycle()
             }
         }
     }
@@ -288,6 +310,153 @@ struct PresetListView: View {
             }
         }
         .frame(width: 400, height: 350)
+    }
+}
+
+// MARK: - Shader Test Report View
+
+struct ShaderTestReportView: View {
+    let testManager: ShaderTestManager
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "testtube.2")
+                    .foregroundStyle(.cyan)
+                    .font(.title2)
+                Text("Shader Compilation Test")
+                    .font(.headline)
+                Spacer()
+                if !testManager.isRunning {
+                    Button("Dismiss") {
+                        onDismiss()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                }
+            }
+
+            Divider()
+
+            // Progress section
+            VStack(alignment: .leading, spacing: 6) {
+                ProgressView(value: testManager.progress)
+                    .tint(testManager.isRunning ? .cyan : (testManager.failedCount == 0 ? .green : .orange))
+
+                HStack {
+                    if testManager.isRunning {
+                        Text("Testing: \(testManager.currentPresetName)")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    Spacer()
+                    Text("\(testManager.completed) / \(testManager.total)")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            // Summary
+            if !testManager.isRunning && testManager.completed > 0 {
+                HStack(spacing: 16) {
+                    Label("\(testManager.passedCount) passed", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .font(.system(.body, design: .monospaced))
+                    Label("\(testManager.failedCount) failed", systemImage: "xmark.circle.fill")
+                        .foregroundStyle(testManager.failedCount > 0 ? .red : .secondary)
+                        .font(.system(.body, design: .monospaced))
+
+                    let skippedCount = testManager.results.filter({ $0.warpResult == .skipped && $0.compResult == .skipped }).count
+                    if skippedCount > 0 {
+                        Label("\(skippedCount) skipped (v1)", systemImage: "minus.circle.fill")
+                            .foregroundStyle(.secondary)
+                            .font(.system(.body, design: .monospaced))
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+
+            // Failed presets list
+            if !testManager.failedResults.isEmpty {
+                Text("Failed Presets:")
+                    .font(.system(.caption, design: .monospaced).bold())
+
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 4) {
+                        ForEach(testManager.failedResults) { result in
+                            HStack(spacing: 6) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.red)
+                                    .font(.caption2)
+                                Text(result.presetName)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                Spacer()
+                                if result.warpResult == .failed {
+                                    Text("warp")
+                                        .font(.system(.caption2, design: .monospaced))
+                                        .foregroundStyle(.red)
+                                        .padding(.horizontal, 4)
+                                        .padding(.vertical, 1)
+                                        .background(.red.opacity(0.15), in: RoundedRectangle(cornerRadius: 3))
+                                }
+                                if result.compResult == .failed {
+                                    Text("comp")
+                                        .font(.system(.caption2, design: .monospaced))
+                                        .foregroundStyle(.red)
+                                        .padding(.horizontal, 4)
+                                        .padding(.vertical, 1)
+                                        .background(.red.opacity(0.15), in: RoundedRectangle(cornerRadius: 3))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Copy report button
+            if !testManager.isRunning && testManager.completed > 0 {
+                HStack {
+                    Spacer()
+                    Button("Copy Report") {
+                        let report = buildReport()
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(report, forType: .string)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+        }
+        .padding()
+        .frame(width: 600, height: 450)
+    }
+
+    private func buildReport() -> String {
+        var lines: [String] = []
+        lines.append("Shader Compilation Test Report")
+        lines.append("==============================")
+        lines.append("Total: \(testManager.total)")
+        lines.append("Passed: \(testManager.passedCount)")
+        lines.append("Failed: \(testManager.failedCount)")
+        let skipped = testManager.results.filter { $0.warpResult == .skipped && $0.compResult == .skipped }.count
+        lines.append("Skipped (v1): \(skipped)")
+        lines.append("")
+
+        if !testManager.failedResults.isEmpty {
+            lines.append("Failed Presets:")
+            lines.append("---------------")
+            for result in testManager.failedResults {
+                var tags: [String] = []
+                if result.warpResult == .failed { tags.append("warp") }
+                if result.compResult == .failed { tags.append("comp") }
+                lines.append("  \(result.presetName) [\(tags.joined(separator: ", "))]")
+            }
+        }
+
+        return lines.joined(separator: "\n")
     }
 }
 
