@@ -77,4 +77,17 @@ nonisolated struct PresetParameters: Sendable {
     var perPixelExpressions: [CompiledAssignment] = []
     var variableTable: VariableTable?
     var contextBridge: ContextBridge?
+
+    // Custom waves and shapes (up to 4 each)
+    var customWaves: [CustomWavePreset] = []
+    var customShapes: [CustomShapePreset] = []
+
+    // V2 shader support (PSVERSION=2)
+    var psVersion: Int = 0
+    var warpShaderSource: String?
+    var compShaderSource: String?
+    var randPreset: SIMD4<Float> = SIMD4<Float>(
+        Float.random(in: 0...1), Float.random(in: 0...1),
+        Float.random(in: 0...1), Float.random(in: 0...1)
+    )
 }

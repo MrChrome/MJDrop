@@ -89,6 +89,17 @@ nonisolated struct MilkFileParser {
         // Compile expressions
         compileExpressions(from: values, into: &p)
 
+        // Parse custom waves and shapes
+        p.customWaves = (0..<4).map { compileCustomWave(index: $0, from: values) }
+        p.customShapes = (0..<4).map { compileCustomShape(index: $0, from: values) }
+
+        // V2 shader extraction
+        p.psVersion = values.int("PSVERSION") ?? 0
+        if p.psVersion >= 2 {
+            p.warpShaderSource = extractShaderSource(prefix: "warp_", from: values)
+            p.compShaderSource = extractShaderSource(prefix: "comp_", from: values)
+        }
+
         return p
     }
 
@@ -156,6 +167,200 @@ nonisolated struct MilkFileParser {
         let table = builder.build()
         p.variableTable = table
         p.contextBridge = ContextBridge(table: table)
+    }
+
+    // MARK: - Custom Wave Compilation
+
+    private static func compileCustomWave(index: Int, from values: [String: String]) -> CustomWavePreset {
+        var config = CustomWaveConfig()
+        let prefix = "wavecode_\(index)_"
+
+        // Parse config values
+        config.enabled = values.bool(prefix + "enabled") ?? false
+        config.samples = values.int(prefix + "samples") ?? 512
+        config.sep = values.int(prefix + "sep") ?? 0
+        config.bSpectrum = values.bool(prefix + "bSpectrum") ?? false
+        config.bUseDots = values.bool(prefix + "bUseDots") ?? false
+        config.bDrawThick = values.bool(prefix + "bDrawThick") ?? false
+        config.bAdditive = values.bool(prefix + "bAdditive") ?? false
+        config.scaling = values.float(prefix + "scaling") ?? 1.0
+        config.smoothing = values.float(prefix + "smoothing") ?? 0.5
+        config.r = values.float(prefix + "r") ?? 1.0
+        config.g = values.float(prefix + "g") ?? 1.0
+        config.b = values.float(prefix + "b") ?? 1.0
+        config.a = values.float(prefix + "a") ?? 1.0
+
+        guard config.enabled else { return CustomWavePreset(config: config) }
+
+        let builder = VariableTableBuilder()
+
+        // Pre-register known variables for custom waves
+        let knownVars = [
+            "time", "fps", "frame",
+            "bass", "mid", "treb", "bass_att", "mid_att", "treb_att",
+            "sample", "value1", "value2",
+            "x", "y", "r", "g", "b", "a"
+        ]
+        for name in knownVars { builder.register(name) }
+        for i in 1...32 { builder.register("q\(i)") }
+        for i in 1...8 { builder.register("t\(i)") }
+
+        // Collect expression lines: wave_N_initM, wave_N_per_frameM, wave_N_per_pointM
+        let exprPrefix = "wave_\(index)_"
+        var initLines: [(Int, String)] = []
+        var perFrameLines: [(Int, String)] = []
+        var perPointLines: [(Int, String)] = []
+
+        for (key, value) in values {
+            let lk = key.lowercased()
+            guard lk.hasPrefix(exprPrefix) else { continue }
+            let suffix = String(lk.dropFirst(exprPrefix.count))
+
+            if suffix.hasPrefix("init") {
+                if let n = Int(suffix.dropFirst("init".count)) {
+                    initLines.append((n, value))
+                }
+            } else if suffix.hasPrefix("per_frame") {
+                if let n = Int(suffix.dropFirst("per_frame".count)) {
+                    perFrameLines.append((n, value))
+                }
+            } else if suffix.hasPrefix("per_point") {
+                if let n = Int(suffix.dropFirst("per_point".count)) {
+                    perPointLines.append((n, value))
+                }
+            }
+        }
+
+        initLines.sort { $0.0 < $1.0 }
+        perFrameLines.sort { $0.0 < $1.0 }
+        perPointLines.sort { $0.0 < $1.0 }
+
+        let initExprs = initLines.flatMap { ExpressionParser.parseLine($0.1, builder: builder) }
+        let perFrameExprs = perFrameLines.flatMap { ExpressionParser.parseLine($0.1, builder: builder) }
+        let perPointExprs = perPointLines.flatMap { ExpressionParser.parseLine($0.1, builder: builder) }
+
+        let table = builder.build()
+        let bridge = CustomWaveBridge(table: table)
+
+        return CustomWavePreset(
+            config: config,
+            initExpressions: initExprs,
+            perFrameExpressions: perFrameExprs,
+            perPointExpressions: perPointExprs,
+            variableTable: table,
+            bridge: bridge
+        )
+    }
+
+    // MARK: - Custom Shape Compilation
+
+    private static func compileCustomShape(index: Int, from values: [String: String]) -> CustomShapePreset {
+        var config = CustomShapeConfig()
+        let prefix = "shapecode_\(index)_"
+
+        // Parse config values
+        config.enabled = values.bool(prefix + "enabled") ?? false
+        config.sides = values.int(prefix + "sides") ?? 4
+        config.additive = values.bool(prefix + "additive") ?? false
+        config.thickOutline = values.bool(prefix + "thickOutline") ?? false
+        config.textured = values.bool(prefix + "textured") ?? false
+        config.numInst = values.int(prefix + "num_inst") ?? 1
+        config.x = values.float(prefix + "x") ?? 0.5
+        config.y = values.float(prefix + "y") ?? 0.5
+        config.rad = values.float(prefix + "rad") ?? 0.1
+        config.ang = values.float(prefix + "ang") ?? 0.0
+        config.texZoom = values.float(prefix + "tex_zoom") ?? 1.0
+        config.texAng = values.float(prefix + "tex_ang") ?? 0.0
+        config.r = values.float(prefix + "r") ?? 1.0
+        config.g = values.float(prefix + "g") ?? 0.0
+        config.b = values.float(prefix + "b") ?? 0.0
+        config.a = values.float(prefix + "a") ?? 1.0
+        config.r2 = values.float(prefix + "r2") ?? 0.0
+        config.g2 = values.float(prefix + "g2") ?? 1.0
+        config.b2 = values.float(prefix + "b2") ?? 0.0
+        config.a2 = values.float(prefix + "a2") ?? 0.0
+        config.borderR = values.float(prefix + "border_r") ?? 1.0
+        config.borderG = values.float(prefix + "border_g") ?? 1.0
+        config.borderB = values.float(prefix + "border_b") ?? 1.0
+        config.borderA = values.float(prefix + "border_a") ?? 0.1
+
+        guard config.enabled else { return CustomShapePreset(config: config) }
+
+        let builder = VariableTableBuilder()
+
+        // Pre-register known variables for custom shapes
+        let knownVars = [
+            "time", "fps", "frame",
+            "bass", "mid", "treb", "bass_att", "mid_att", "treb_att",
+            "instance", "num_inst",
+            "x", "y", "rad", "ang", "sides",
+            "r", "g", "b", "a",
+            "r2", "g2", "b2", "a2",
+            "border_r", "border_g", "border_b", "border_a",
+            "tex_ang", "tex_zoom",
+            "additive", "thickoutline", "textured"
+        ]
+        for name in knownVars { builder.register(name) }
+        for i in 1...32 { builder.register("q\(i)") }
+        for i in 1...8 { builder.register("t\(i)") }
+
+        // Collect expression lines: shape_N_initM, shape_N_per_frameM
+        let exprPrefix = "shape_\(index)_"
+        var initLines: [(Int, String)] = []
+        var perFrameLines: [(Int, String)] = []
+
+        for (key, value) in values {
+            let lk = key.lowercased()
+            guard lk.hasPrefix(exprPrefix) else { continue }
+            let suffix = String(lk.dropFirst(exprPrefix.count))
+
+            if suffix.hasPrefix("init") {
+                if let n = Int(suffix.dropFirst("init".count)) {
+                    initLines.append((n, value))
+                }
+            } else if suffix.hasPrefix("per_frame") {
+                if let n = Int(suffix.dropFirst("per_frame".count)) {
+                    perFrameLines.append((n, value))
+                }
+            }
+        }
+
+        initLines.sort { $0.0 < $1.0 }
+        perFrameLines.sort { $0.0 < $1.0 }
+
+        let initExprs = initLines.flatMap { ExpressionParser.parseLine($0.1, builder: builder) }
+        let perFrameExprs = perFrameLines.flatMap { ExpressionParser.parseLine($0.1, builder: builder) }
+
+        let table = builder.build()
+        let bridge = CustomShapeBridge(table: table)
+
+        return CustomShapePreset(
+            config: config,
+            initExpressions: initExprs,
+            perFrameExpressions: perFrameExprs,
+            variableTable: table,
+            bridge: bridge
+        )
+    }
+
+    // MARK: - V2 Shader Source Extraction
+
+    /// Extract multi-line shader source from numbered lines (e.g., warp_1=`..., warp_2=`...).
+    /// Strips the leading backtick that Milkdrop uses as a line continuation marker.
+    private static func extractShaderSource(prefix: String, from values: [String: String]) -> String? {
+        var lines: [(Int, String)] = []
+        for (key, value) in values {
+            let lk = key.lowercased()
+            if lk.hasPrefix(prefix), let n = Int(lk.dropFirst(prefix.count)) {
+                // Strip leading backtick
+                let cleaned = value.hasPrefix("`") ? String(value.dropFirst()) : value
+                lines.append((n, cleaned))
+            }
+        }
+        guard !lines.isEmpty else { return nil }
+        lines.sort { $0.0 < $1.0 }
+        let source = lines.map { $0.1 }.joined(separator: "\n")
+        return source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : source
     }
 
     /// Parse the INI content into a flat key-value dictionary.

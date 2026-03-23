@@ -37,6 +37,33 @@ vertex WarpVertexOut warpVertex(
     return out;
 }
 
+// V2 warp vertex output — includes uv_orig for v2 fragment shaders
+struct WarpV2VertexOut {
+    float4 position [[position]];
+    float4 color;
+    float2 uv;         // warped UV
+    float2 uv_orig;    // original (static) UV
+    float2 rad_ang;    // polar coords
+};
+
+vertex WarpV2VertexOut warpVertexV2(
+    const device MilkdropVertex* vertices [[buffer(BufferIndexVertices)]],
+    const device FrameUniforms& uniforms [[buffer(BufferIndexUniforms)]],
+    uint vid [[vertex_id]])
+{
+    MilkdropVertex in = vertices[vid];
+    WarpV2VertexOut out;
+
+    out.position = float4(in.position.xy * 2.0 - 1.0, 0.0, 1.0);
+    out.position.y = -out.position.y;
+    out.color = in.color;
+    out.uv = in.uv;
+    out.uv_orig = in.uvStatic;
+    out.rad_ang = in.radAng;
+
+    return out;
+}
+
 fragment float4 warpFragment(
     WarpVertexOut in [[stage_in]],
     texture2d<float> previousFrame [[texture(TextureIndexPreviousFrame)]],

@@ -36,6 +36,14 @@ final class MilkdropRenderer: NSObject, MTKViewDelegate {
     // Expression evaluation
     private var expressionContext: ExpressionContext?
 
+    // Custom wave and shape renderers
+    private let customWaveRenderer: CustomWaveRenderer
+    private let customShapeRenderer: CustomShapeRenderer
+
+    // V2 shader pipeline states (nil = use v1 path)
+    private var v2WarpPipeline: MTLRenderPipelineState?
+    private var v2CompPipeline: MTLRenderPipelineState?
+
     // Audio data bridge — set from main thread
     var fftMagnitudes: [Float] = Array(repeating: 0, count: 64)
     var waveformSamples: [Float] = Array(repeating: 0, count: 512)
@@ -78,6 +86,9 @@ final class MilkdropRenderer: NSObject, MTKViewDelegate {
             options: .storageModeShared
         )!
 
+        self.customWaveRenderer = CustomWaveRenderer(device: device)
+        self.customShapeRenderer = CustomShapeRenderer(device: device)
+
         super.init()
     }
 
@@ -101,6 +112,46 @@ final class MilkdropRenderer: NSObject, MTKViewDelegate {
             }
         } else {
             expressionContext = nil
+        }
+
+        // Initialize custom wave and shape expression contexts
+        let audioSnap = AudioSnapshot(from: audioAnalyzer)
+        customWaveRenderer.loadPreset(
+            preset.customWaves, audio: audioSnap,
+            mainContext: expressionContext, mainBridge: preset.contextBridge
+        )
+        customShapeRenderer.loadPreset(
+            preset.customShapes, audio: audioSnap,
+            mainContext: expressionContext, mainBridge: preset.contextBridge
+        )
+
+        // V2 shader compilation
+        v2WarpPipeline = nil
+        v2CompPipeline = nil
+        if preset.psVersion >= 2 {
+            let name = "preset"
+            if let hlsl = preset.warpShaderSource,
+               let result = ShaderTranspiler.transpile(hlsl: hlsl, type: .warp, presetName: name) {
+                v2WarpPipeline = pipeline.compileV2WarpPipeline(
+                    metalSource: result.metalSource, functionName: result.functionName
+                )
+                if v2WarpPipeline != nil {
+                    print("[V2] Warp shader compiled successfully")
+                } else {
+                    print("[V2] Warp shader compilation failed — falling back to v1")
+                }
+            }
+            if let hlsl = preset.compShaderSource,
+               let result = ShaderTranspiler.transpile(hlsl: hlsl, type: .composite, presetName: name) {
+                v2CompPipeline = pipeline.compileV2CompPipeline(
+                    metalSource: result.metalSource, functionName: result.functionName
+                )
+                if v2CompPipeline != nil {
+                    print("[V2] Composite shader compiled successfully")
+                } else {
+                    print("[V2] Composite shader compilation failed — falling back to v1")
+                }
+            }
         }
 
         // Clear the feedback textures so the old preset's colors don't bleed through
@@ -193,28 +244,51 @@ final class MilkdropRenderer: NSObject, MTKViewDelegate {
         passDesc.colorAttachments[0].storeAction = .store
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDesc) else { return }
-        encoder.setRenderPipelineState(pipeline.warpPipeline)
-        encoder.setVertexBuffer(meshGrid.vertexBuffer, offset: 0, index: BufferIndex.vertices.rawValue)
-        encoder.setVertexBytes(&uniforms, length: MemoryLayout<FrameUniforms>.stride,
-                               index: BufferIndex.uniforms.rawValue)
-        encoder.setFragmentTexture(textureManager.backTexture,
-                                    index: TextureIndex.previousFrame.rawValue)
-        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<FrameUniforms>.stride,
-                                  index: BufferIndex.uniforms.rawValue)
-        encoder.drawIndexedPrimitives(
-            type: .triangle,
-            indexCount: meshGrid.indexCount,
-            indexType: .uint32,
-            indexBuffer: meshGrid.indexBuffer,
-            indexBufferOffset: 0
-        )
+
+        if let v2Pipeline = v2WarpPipeline {
+            // V2 warp path: use runtime-compiled fragment shader
+            encoder.setRenderPipelineState(v2Pipeline)
+            encoder.setVertexBuffer(meshGrid.vertexBuffer, offset: 0, index: BufferIndex.vertices.rawValue)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<FrameUniforms>.stride,
+                                   index: BufferIndex.uniforms.rawValue)
+
+            // Fragment: V2PsUniforms at buffer 0
+            var v2u = buildV2Uniforms(time: uniforms.time)
+            encoder.setFragmentBytes(&v2u, length: MemoryLayout<V2PsUniforms>.stride, index: 0)
+
+            // Textures: main(0), blur1-3(1-3), noise(4-8)
+            encoder.setFragmentTexture(textureManager.backTexture, index: 0)
+            bindBlurAndNoiseTextures(encoder: encoder)
+
+            encoder.drawIndexedPrimitives(
+                type: .triangle,
+                indexCount: meshGrid.indexCount,
+                indexType: .uint32,
+                indexBuffer: meshGrid.indexBuffer,
+                indexBufferOffset: 0
+            )
+        } else {
+            // V1 warp path (original)
+            encoder.setRenderPipelineState(pipeline.warpPipeline)
+            encoder.setVertexBuffer(meshGrid.vertexBuffer, offset: 0, index: BufferIndex.vertices.rawValue)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<FrameUniforms>.stride,
+                                   index: BufferIndex.uniforms.rawValue)
+            encoder.setFragmentTexture(textureManager.backTexture,
+                                        index: TextureIndex.previousFrame.rawValue)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<FrameUniforms>.stride,
+                                      index: BufferIndex.uniforms.rawValue)
+            encoder.drawIndexedPrimitives(
+                type: .triangle,
+                indexCount: meshGrid.indexCount,
+                indexType: .uint32,
+                indexBuffer: meshGrid.indexBuffer,
+                indexBufferOffset: 0
+            )
+        }
         encoder.endEncoding()
     }
 
     private func encodeWavePass(commandBuffer: MTLCommandBuffer, uniforms: inout FrameUniforms, time: Float) {
-        let waveCount = generateWaveVertices(time: time)
-        guard waveCount > 1 else { return }
-
         let passDesc = MTLRenderPassDescriptor()
         passDesc.colorAttachments[0].texture = textureManager.frontTexture
         passDesc.colorAttachments[0].loadAction = .load
@@ -222,14 +296,44 @@ final class MilkdropRenderer: NSObject, MTKViewDelegate {
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDesc) else { return }
 
-        let wavePipeline = currentPreset.additiveWave
-            ? pipeline.wavePipelineAdditive
-            : pipeline.wavePipelineAlpha
-        encoder.setRenderPipelineState(wavePipeline)
-        encoder.setVertexBuffer(waveVertexBuffer, offset: 0, index: 0)
-        encoder.setVertexBytes(&uniforms, length: MemoryLayout<FrameUniforms>.stride,
-                               index: BufferIndex.uniforms.rawValue)
-        encoder.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: waveCount)
+        let audioSnap = AudioSnapshot(from: audioAnalyzer)
+        let aspectRatio = uniforms.aspectRatio
+
+        // 1. Custom shapes (behind everything)
+        customShapeRenderer.encode(
+            encoder: encoder, pipeline: pipeline,
+            presets: basePreset.customShapes,
+            audio: audioSnap,
+            time: time, fps: fps, frame: frameCount,
+            aspectRatio: aspectRatio,
+            mainTexture: textureManager.frontTexture,
+            mainContext: expressionContext, mainBridge: basePreset.contextBridge
+        )
+
+        // 2. Standard wave (existing 8 modes)
+        let waveCount = generateWaveVertices(time: time)
+        if waveCount > 1 {
+            let wavePipeline = currentPreset.additiveWave
+                ? pipeline.wavePipelineAdditive
+                : pipeline.wavePipelineAlpha
+            encoder.setRenderPipelineState(wavePipeline)
+            encoder.setVertexBuffer(waveVertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<FrameUniforms>.stride,
+                                   index: BufferIndex.uniforms.rawValue)
+            encoder.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: waveCount)
+        }
+
+        // 3. Custom waves (on top)
+        customWaveRenderer.encode(
+            encoder: encoder, pipeline: pipeline,
+            presets: basePreset.customWaves,
+            waveformSamples: waveformSamples,
+            fftMagnitudes: fftMagnitudes,
+            audio: audioSnap,
+            time: time, fps: fps, frame: frameCount,
+            mainContext: expressionContext, mainBridge: basePreset.contextBridge
+        )
+
         encoder.endEncoding()
     }
 
@@ -240,19 +344,35 @@ final class MilkdropRenderer: NSObject, MTKViewDelegate {
         guard let passDesc = view.currentRenderPassDescriptor else { return }
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDesc) else { return }
 
-        encoder.setRenderPipelineState(pipeline.compositePipeline)
-        encoder.setVertexBuffer(quadBuffer, offset: 0, index: 0)
+        if let v2Pipeline = v2CompPipeline {
+            // V2 composite path
+            encoder.setRenderPipelineState(v2Pipeline)
+            encoder.setVertexBuffer(quadBuffer, offset: 0, index: 0)
 
-        encoder.setFragmentTexture(textureManager.frontTexture,
-                                    index: TextureIndex.current.rawValue)
-        for i in 0..<min(3, textureManager.blurTextures.count) {
-            encoder.setFragmentTexture(textureManager.blurTextures[i].source,
-                                        index: TextureIndex.blur1.rawValue + i)
+            var v2u = buildV2Uniforms(time: uniforms.time)
+            encoder.setFragmentBytes(&v2u, length: MemoryLayout<V2PsUniforms>.stride, index: 0)
+
+            // Textures: main(0) = frontTexture, blur1-3(1-3), noise(4-8)
+            encoder.setFragmentTexture(textureManager.frontTexture, index: 0)
+            bindBlurAndNoiseTextures(encoder: encoder)
+
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        } else {
+            // V1 composite path (original)
+            encoder.setRenderPipelineState(pipeline.compositePipeline)
+            encoder.setVertexBuffer(quadBuffer, offset: 0, index: 0)
+
+            encoder.setFragmentTexture(textureManager.frontTexture,
+                                        index: TextureIndex.current.rawValue)
+            for i in 0..<min(3, textureManager.blurTextures.count) {
+                encoder.setFragmentTexture(textureManager.blurTextures[i].source,
+                                            index: TextureIndex.blur1.rawValue + i)
+            }
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<FrameUniforms>.stride,
+                                      index: BufferIndex.uniforms.rawValue)
+
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         }
-        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<FrameUniforms>.stride,
-                                  index: BufferIndex.uniforms.rawValue)
-
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         encoder.endEncoding()
     }
 
@@ -307,6 +427,86 @@ final class MilkdropRenderer: NSObject, MTKViewDelegate {
             solarize: p.solarize ? 1 : 0,
             invert: p.invert ? 1 : 0
         )
+    }
+
+    private func buildV2Uniforms(time: Float) -> V2PsUniforms {
+        let a = audioAnalyzer
+        let w = Float(textureManager.width)
+        let h = Float(max(textureManager.height, 1))
+        let ar = w / h
+
+        var u = V2PsUniforms()
+        u.time = time
+        u.fps = fps
+        u.frame = Float(frameCount)
+        u.bass = a.bass
+        u.mid = a.mid
+        u.treb = a.treb
+        u.bass_att = a.bassAtt
+        u.mid_att = a.midAtt
+        u.treb_att = a.trebAtt
+        u.decay = currentPreset.decay
+
+        // Aspect: .xy = multiplier to get square pixels, .zw = inverse
+        if ar > 1 {
+            u.aspect = SIMD4(1.0, ar, 1.0, 1.0 / ar)
+        } else {
+            u.aspect = SIMD4(1.0 / ar, 1.0, ar, 1.0)
+        }
+
+        u.texsize = SIMD4(w, h, 1.0 / w, 1.0 / h)
+
+        // Random values
+        u.rand_frame = SIMD4(
+            Float.random(in: 0...1), Float.random(in: 0...1),
+            Float.random(in: 0...1), Float.random(in: 0...1)
+        )
+        u.rand_preset = currentPreset.randPreset
+
+        // Slowly roaming values
+        u.roam_cos = SIMD4(
+            cos(time * 0.005), cos(time * 0.008),
+            cos(time * 0.013), cos(time * 0.022)
+        )
+        u.roam_sin = SIMD4(
+            sin(time * 0.005), sin(time * 0.008),
+            sin(time * 0.013), sin(time * 0.022)
+        )
+
+        // Read q1..q32 from expression context
+        if let ctx = expressionContext, let bridge = basePreset.contextBridge {
+            for i in 0..<32 {
+                if let slot = bridge.q[i] {
+                    let val = ctx[slot]
+                    switch i / 4 {
+                    case 0: u._qa[i % 4] = val
+                    case 1: u._qb[i % 4] = val
+                    case 2: u._qc[i % 4] = val
+                    case 3: u._qd[i % 4] = val
+                    case 4: u._qe[i % 4] = val
+                    case 5: u._qf[i % 4] = val
+                    case 6: u._qg[i % 4] = val
+                    case 7: u._qh[i % 4] = val
+                    default: break
+                    }
+                }
+            }
+        }
+
+        return u
+    }
+
+    private func bindBlurAndNoiseTextures(encoder: MTLRenderCommandEncoder) {
+        // Blur textures at indices 1-3
+        for i in 0..<min(3, textureManager.blurTextures.count) {
+            encoder.setFragmentTexture(textureManager.blurTextures[i].source, index: 1 + i)
+        }
+        // Noise textures at indices 4-8
+        encoder.setFragmentTexture(textureManager.noiseLQ, index: 4)
+        encoder.setFragmentTexture(textureManager.noiseMQ, index: 5)
+        encoder.setFragmentTexture(textureManager.noiseHQ, index: 6)
+        encoder.setFragmentTexture(textureManager.noiseVolLQ, index: 7)
+        encoder.setFragmentTexture(textureManager.noiseVolHQ, index: 8)
     }
 
     /// Generate wave vertices based on audio data and wave mode.

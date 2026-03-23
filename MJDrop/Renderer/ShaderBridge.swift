@@ -25,6 +25,13 @@ struct SimpleVertex {
     var uv: SIMD2<Float>
 }
 
+/// Matches ColoredVertex in ShaderTypes.h
+struct ColoredVertex {
+    var position: SIMD2<Float>
+    var color: SIMD4<Float>
+    var uv: SIMD2<Float>
+}
+
 // MARK: - Uniform Types
 
 /// Matches FrameUniforms in ShaderTypes.h
@@ -74,6 +81,47 @@ struct BlurUniforms {
     var texelSize: SIMD2<Float>
     var horizontal: Int32
     var padding: Int32
+}
+
+/// Matches V2PsUniforms in ShaderTypes.h
+struct V2PsUniforms {
+    var time: Float = 0
+    var fps: Float = 60
+    var frame: Float = 0
+
+    var bass: Float = 0
+    var mid: Float = 0
+    var treb: Float = 0
+    var bass_att: Float = 0
+    var mid_att: Float = 0
+    var treb_att: Float = 0
+
+    var _pad0: Float = 0
+    var _pad0b: Float = 0
+    var _pad0c: Float = 0
+
+    var aspect: SIMD4<Float> = .one
+    var texsize: SIMD4<Float> = .one
+
+    var rand_frame: SIMD4<Float> = .zero
+    var rand_preset: SIMD4<Float> = .zero
+
+    var roam_cos: SIMD4<Float> = .zero
+    var roam_sin: SIMD4<Float> = .zero
+
+    var _qa: SIMD4<Float> = .zero  // q1-4
+    var _qb: SIMD4<Float> = .zero  // q5-8
+    var _qc: SIMD4<Float> = .zero  // q9-12
+    var _qd: SIMD4<Float> = .zero  // q13-16
+    var _qe: SIMD4<Float> = .zero  // q17-20
+    var _qf: SIMD4<Float> = .zero  // q21-24
+    var _qg: SIMD4<Float> = .zero  // q25-28
+    var _qh: SIMD4<Float> = .zero  // q29-32
+
+    var decay: Float = 0.98
+    var _pad1: Float = 0
+    var _pad2: Float = 0
+    var _pad3: Float = 0
 }
 
 // MARK: - Buffer / Texture Indices
