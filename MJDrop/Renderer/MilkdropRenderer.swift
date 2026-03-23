@@ -48,6 +48,9 @@ final class MilkdropRenderer: NSObject, MTKViewDelegate {
     var fftMagnitudes: [Float] = Array(repeating: 0, count: 64)
     var waveformSamples: [Float] = Array(repeating: 0, count: 512)
 
+    // Shader error callback — called on main thread when a V2 shader fails to compile
+    var onShaderError: ((String) -> Void)?
+
     // Preset management
     private var presetIndex: Int = 0
 
@@ -128,29 +131,46 @@ final class MilkdropRenderer: NSObject, MTKViewDelegate {
         // V2 shader compilation
         v2WarpPipeline = nil
         v2CompPipeline = nil
+        var shaderErrors: [String] = []
         if preset.psVersion >= 2 {
             let name = "preset"
             if let hlsl = preset.warpShaderSource,
                let result = ShaderTranspiler.transpile(hlsl: hlsl, type: .warp, presetName: name) {
-                v2WarpPipeline = pipeline.compileV2WarpPipeline(
+                let compResult = pipeline.compileV2WarpPipeline(
                     metalSource: result.metalSource, functionName: result.functionName
                 )
+                v2WarpPipeline = compResult.pipeline
                 if v2WarpPipeline != nil {
                     print("[V2] Warp shader compiled successfully")
                 } else {
                     print("[V2] Warp shader compilation failed — falling back to v1")
+                    if let err = compResult.error {
+                        shaderErrors.append("V2 Warp Shader Compilation Failed\nPreset: \(preset.name)\n\n\(err)")
+                    }
                 }
             }
             if let hlsl = preset.compShaderSource,
                let result = ShaderTranspiler.transpile(hlsl: hlsl, type: .composite, presetName: name) {
-                v2CompPipeline = pipeline.compileV2CompPipeline(
+                let compResult = pipeline.compileV2CompPipeline(
                     metalSource: result.metalSource, functionName: result.functionName
                 )
+                v2CompPipeline = compResult.pipeline
                 if v2CompPipeline != nil {
                     print("[V2] Composite shader compiled successfully")
                 } else {
                     print("[V2] Composite shader compilation failed — falling back to v1")
+                    if let err = compResult.error {
+                        shaderErrors.append("V2 Composite Shader Compilation Failed\nPreset: \(preset.name)\n\n\(err)")
+                    }
                 }
+            }
+        }
+
+        // Notify UI of shader errors
+        if !shaderErrors.isEmpty, let callback = onShaderError {
+            let message = shaderErrors.joined(separator: "\n\n---\n\n")
+            DispatchQueue.main.async {
+                callback(message)
             }
         }
 

@@ -129,19 +129,28 @@ final class RenderPipeline {
 
     // MARK: - V2 Dynamic Compilation
 
-    /// Compile a v2 warp fragment shader from transpiled Metal source.
-    /// Returns nil on failure (transpilation error, compilation error, etc.).
-    func compileV2WarpPipeline(metalSource: String, functionName: String) -> MTLRenderPipelineState? {
-        if let cached = v2PipelineCache[metalSource] { return cached }
+    /// Result type for V2 shader compilation.
+    struct V2CompileResult {
+        let pipeline: MTLRenderPipelineState?
+        let error: String?
+    }
 
-        guard let runtimeLibrary = compileLibrary(source: metalSource, label: "v2 warp") else { return nil }
+    /// Compile a v2 warp fragment shader from transpiled Metal source.
+    func compileV2WarpPipeline(metalSource: String, functionName: String) -> V2CompileResult {
+        if let cached = v2PipelineCache[metalSource] { return V2CompileResult(pipeline: cached, error: nil) }
+
+        let (runtimeLibrary, compileErr) = compileLibrary(source: metalSource, label: "v2 warp")
+        guard let runtimeLibrary else {
+            return V2CompileResult(pipeline: nil, error: compileErr)
+        }
         guard let fragFunc = runtimeLibrary.makeFunction(name: functionName) else {
-            print("[RenderPipeline] v2 warp function '\(functionName)' not found in compiled library")
-            return nil
+            let msg = "v2 warp function '\(functionName)' not found in compiled library"
+            print("[RenderPipeline] \(msg)")
+            return V2CompileResult(pipeline: nil, error: msg)
         }
         guard let vertFunc = defaultLibrary.makeFunction(name: "warpVertexV2") else {
             print("[RenderPipeline] warpVertexV2 not found in default library")
-            return nil
+            return V2CompileResult(pipeline: nil, error: nil)
         }
 
         let desc = MTLRenderPipelineDescriptor()
@@ -152,25 +161,30 @@ final class RenderPipeline {
         do {
             let pso = try device.makeRenderPipelineState(descriptor: desc)
             v2PipelineCache[metalSource] = pso
-            return pso
+            return V2CompileResult(pipeline: pso, error: nil)
         } catch {
-            print("[RenderPipeline] v2 warp pipeline creation failed: \(error)")
-            return nil
+            let msg = "v2 warp pipeline creation failed: \(error)"
+            print("[RenderPipeline] \(msg)")
+            return V2CompileResult(pipeline: nil, error: msg)
         }
     }
 
     /// Compile a v2 composite fragment shader from transpiled Metal source.
-    func compileV2CompPipeline(metalSource: String, functionName: String) -> MTLRenderPipelineState? {
-        if let cached = v2PipelineCache[metalSource] { return cached }
+    func compileV2CompPipeline(metalSource: String, functionName: String) -> V2CompileResult {
+        if let cached = v2PipelineCache[metalSource] { return V2CompileResult(pipeline: cached, error: nil) }
 
-        guard let runtimeLibrary = compileLibrary(source: metalSource, label: "v2 comp") else { return nil }
+        let (runtimeLibrary, compileErr) = compileLibrary(source: metalSource, label: "v2 comp")
+        guard let runtimeLibrary else {
+            return V2CompileResult(pipeline: nil, error: compileErr)
+        }
         guard let fragFunc = runtimeLibrary.makeFunction(name: functionName) else {
-            print("[RenderPipeline] v2 comp function '\(functionName)' not found in compiled library")
-            return nil
+            let msg = "v2 comp function '\(functionName)' not found in compiled library"
+            print("[RenderPipeline] \(msg)")
+            return V2CompileResult(pipeline: nil, error: msg)
         }
         guard let vertFunc = defaultLibrary.makeFunction(name: "compositeVertex") else {
             print("[RenderPipeline] compositeVertex not found in default library")
-            return nil
+            return V2CompileResult(pipeline: nil, error: nil)
         }
 
         let desc = MTLRenderPipelineDescriptor()
@@ -181,25 +195,27 @@ final class RenderPipeline {
         do {
             let pso = try device.makeRenderPipelineState(descriptor: desc)
             v2PipelineCache[metalSource] = pso
-            return pso
+            return V2CompileResult(pipeline: pso, error: nil)
         } catch {
-            print("[RenderPipeline] v2 comp pipeline creation failed: \(error)")
-            return nil
+            let msg = "v2 comp pipeline creation failed: \(error)"
+            print("[RenderPipeline] \(msg)")
+            return V2CompileResult(pipeline: nil, error: msg)
         }
     }
 
-    private func compileLibrary(source: String, label: String) -> MTLLibrary? {
+    private func compileLibrary(source: String, label: String) -> (library: MTLLibrary?, error: String?) {
         let options = MTLCompileOptions()
         options.mathMode = .fast
         do {
-            return try device.makeLibrary(source: source, options: options)
+            let lib = try device.makeLibrary(source: source, options: options)
+            return (lib, nil)
         } catch {
-            print("[RenderPipeline] \(label) shader compilation failed:\n\(error)")
-            // Print first few lines of source for debugging
+            let errorMsg = "\(error)"
+            print("[RenderPipeline] \(label) shader compilation failed:\n\(errorMsg)")
             let lines = source.components(separatedBy: "\n")
             let preview = lines.prefix(10).enumerated().map { "\($0.offset + 1): \($0.element)" }.joined(separator: "\n")
             print("[RenderPipeline] Source preview:\n\(preview)")
-            return nil
+            return (nil, errorMsg)
         }
     }
 }

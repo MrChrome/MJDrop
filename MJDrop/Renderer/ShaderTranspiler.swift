@@ -204,6 +204,11 @@ struct ShaderTranspiler {
             options: .regularExpression
         )
 
+        // Fix float4 declarations initialized from .xyz texture samples.
+        // Our tex sampling transform appends .xyz (float3), but HLSL code may
+        // declare the variable as float4. Downgrade to float3.
+        s = fixFloat4FromXyzSample(s)
+
         // Fix variable redefinitions: when a variable is declared in pre-body
         // (e.g. `float3 neu, ret1;`) and then re-declared in body
         // (e.g. `float3 ret1 = 0;`), convert the second to an assignment.
@@ -217,6 +222,12 @@ struct ShaderTranspiler {
         // Convert HLSL `%` modulo operator to Metal `fmod()`.
         // HLSL allows `%` on float operands; Metal requires `fmod()`.
         s = convertModuloToFmod(s)
+
+        // Fix HLSL vector comparisons that produce bool vectors.
+        // HLSL: `(vec >= 0)` yields a float vector (0.0/1.0).
+        // Metal: `(vec >= 0)` yields a bool vector which can't be assigned to float.
+        // Convert `expr >= val` to `step(val, expr)` and `expr <= val` to `step(expr, val)`.
+        s = fixVectorComparisons(s)
 
         return s
     }
@@ -328,6 +339,45 @@ struct ShaderTranspiler {
             i += 1
         }
         return result
+    }
+
+    // MARK: - Float4 from .xyz Sample Fix
+
+    /// When a `float4` variable is initialized from an expression ending in `.xyz`
+    /// (which is float3), downgrade the declaration to `float3`.
+    /// Handles multi-line initializers (e.g. texture sample calls that span lines).
+    private static func fixFloat4FromXyzSample(_ source: String) -> String {
+        var lines = source.components(separatedBy: "\n")
+        var i = 0
+        while i < lines.count {
+            let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+
+            // Look for `float4 varname = ...`
+            guard trimmed.hasPrefix("float4 "),
+                  trimmed.contains("=") else {
+                i += 1
+                continue
+            }
+
+            // Collect the full statement up to the semicolon
+            var stmtEnd = i
+            var combined = trimmed
+            while !combined.contains(";") && stmtEnd + 1 < lines.count {
+                stmtEnd += 1
+                combined += " " + lines[stmtEnd].trimmingCharacters(in: .whitespaces)
+            }
+
+            // Check if the RHS ends with .xyz or .xyw before the semicolon
+            let beforeSemicolon = combined.components(separatedBy: ";").first ?? combined
+            let rhsTrimmed = beforeSemicolon.trimmingCharacters(in: .whitespaces)
+            if rhsTrimmed.hasSuffix(".xyz") || rhsTrimmed.hasSuffix(".xyzw") == false && rhsTrimmed.hasSuffix(".xyz") {
+                // Downgrade the declaration from float4 to float3
+                lines[i] = lines[i].replacingOccurrences(of: "float4 ", with: "float3 ", options: [], range: lines[i].range(of: "float4 "))
+            }
+
+            i = stmtEnd + 1
+        }
+        return lines.joined(separator: "\n")
     }
 
     // MARK: - Variable Redefinition Fix
@@ -967,6 +1017,66 @@ struct ShaderTranspiler {
         return (operand, end)
     }
 
+    // MARK: - Vector Comparison Fix
+
+    /// HLSL allows comparisons like `(vec >= 0)` which produce a float vector (0.0 or 1.0).
+    /// Metal comparisons produce bool vectors which can't be assigned to float types.
+    /// Convert `(expr >= val)` to `step(val, expr)` and `(expr <= val)` to `step(expr, val)`.
+    private static func fixVectorComparisons(_ source: String) -> String {
+        var s = source
+        // Handle `>= number` inside balanced parentheses
+        s = fixComparisonOp(s, op: ">=")
+        // Handle `<= number` inside balanced parentheses
+        s = fixComparisonOp(s, op: "<=")
+        return s
+    }
+
+    /// Find `(expr OP number)` patterns using balanced parens and replace with step().
+    private static func fixComparisonOp(_ source: String, op: String) -> String {
+        let chars = Array(source.unicodeScalars)
+        var result: [Unicode.Scalar] = []
+        var i = 0
+
+        while i < chars.count {
+            if chars[i] == "(" {
+                // Find matching close paren
+                if let closeIdx = findMatchingParen(chars, from: i) {
+                    let inner = String(String.UnicodeScalarView(Array(chars[(i+1)..<closeIdx])))
+
+                    // Look for ` >= number` or ` <= number` at the end
+                    if let opRange = inner.range(of: op, options: .backwards) {
+                        let lhs = String(inner[inner.startIndex..<opRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+                        let rhs = String(inner[opRange.upperBound...]).trimmingCharacters(in: .whitespaces)
+
+                        // Check rhs is a simple number (possibly with leading dot like .7)
+                        let isNumber = !rhs.isEmpty && rhs.allSatisfy({ $0.isNumber || $0 == "." || $0 == "-" })
+
+                        // Also ensure the operator isn't inside nested parens in lhs
+                        // (check lhs has balanced parens)
+                        let lhsParensBalanced = lhs.filter({ $0 == "(" }).count == lhs.filter({ $0 == ")" }).count
+
+                        if isNumber && lhsParensBalanced {
+                            let replacement: String
+                            if op == ">=" {
+                                replacement = "step(\(rhs), \(lhs))"
+                            } else {
+                                replacement = "step(\(lhs), \(rhs))"
+                            }
+                            result.append(contentsOf: replacement.unicodeScalars)
+                            i = closeIdx + 1
+                            continue
+                        }
+                    }
+                }
+            }
+
+            result.append(chars[i])
+            i += 1
+        }
+
+        return String(String.UnicodeScalarView(result))
+    }
+
     // MARK: - Parsing Helpers
 
     /// Check if `word` appears at position `pos` as a whole word (not preceded by alphanumeric/_).
@@ -1126,6 +1236,11 @@ struct ShaderTranspiler {
         static float2x2 _md_float2x2(float a, float b, float c, float d) {
             return float2x2(float2(a, c), float2(b, d));
         }
+        // Overload: construct float2x2 from a single float4 (HLSL allows this)
+        // HLSL row-major: v.xy = row 0, v.zw = row 1 → Metal columns: (v.x,v.z), (v.y,v.w)
+        static float2x2 _md_float2x2(float4 v) {
+            return float2x2(float2(v.x, v.z), float2(v.y, v.w));
+        }
 
         // Helper: row-major float3x3 constructor
         static float3x3 _md_float3x3(float a, float b, float c,
@@ -1138,9 +1253,15 @@ struct ShaderTranspiler {
         static float _md_lum(float3 c) {
             return dot(c, float3(0.32, 0.49, 0.29));
         }
+        static float _md_lum(float2 c) {
+            return dot(float3(c, 0), float3(0.32, 0.49, 0.29));
+        }
         static float _md_lum(float c) {
             return c;
         }
+
+        // Helper: HLSL length() accepts scalars, Metal does not
+        static float length(float x) { return abs(x); }
 
         // Helpers for HLSL-style implicit float2→float3 conversion
         static float3 _md_f3(float2 v) { return float3(v, 0); }

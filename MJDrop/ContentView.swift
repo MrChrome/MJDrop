@@ -16,12 +16,17 @@ struct ContentView: View {
     @State private var showingPresetFolderPicker = false
     @State private var showingPresetList = false
     @State private var presetSearchText = ""
+    @State private var shaderErrorMessage: String?
+    @State private var showingShaderError = false
 
     var body: some View {
         VStack(spacing: 0) {
             // Milkdrop visualizer
-            MetalVisualizerView(audioManager: audioManager, presetManager: presetManager)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            MetalVisualizerView(audioManager: audioManager, presetManager: presetManager) { errorMessage in
+                shaderErrorMessage = errorMessage
+                showingShaderError = true
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             // Transport bar
             VStack(spacing: 12) {
@@ -160,12 +165,61 @@ struct ContentView: View {
             presetManager.startAutoCycle()
             audioManager.restoreSavedFile()
         }
+        .sheet(isPresented: $showingShaderError) {
+            ShaderErrorView(errorMessage: shaderErrorMessage ?? "Unknown error") {
+                showingShaderError = false
+            }
+        }
     }
 
     private func formatTime(_ time: TimeInterval) -> String {
         let minutes = Int(time) / 60
         let seconds = Int(time) % 60
         return String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
+// MARK: - Shader Error View
+
+struct ShaderErrorView: View {
+    let errorMessage: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.yellow)
+                    .font(.title2)
+                Text("Shader Compilation Error")
+                    .font(.headline)
+                Spacer()
+                Button("Dismiss") {
+                    onDismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+            }
+
+            Divider()
+
+            ScrollView {
+                Text(errorMessage)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            HStack {
+                Spacer()
+                Button("Copy to Clipboard") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(errorMessage, forType: .string)
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding()
+        .frame(width: 600, height: 400)
     }
 }
 

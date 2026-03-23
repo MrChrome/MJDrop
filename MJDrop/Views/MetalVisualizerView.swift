@@ -12,6 +12,7 @@ import MetalKit
 struct MetalVisualizerView: NSViewRepresentable {
     let audioManager: AudioPlayerManager
     let presetManager: PresetManager
+    var onShaderError: ((String) -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -31,10 +32,19 @@ struct MetalVisualizerView: NSViewRepresentable {
         mtkView.enableSetNeedsDisplay = false
         mtkView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
 
+        context.coordinator.mtkView = mtkView
+
         do {
             let renderer = try MilkdropRenderer(device: device, pixelFormat: mtkView.colorPixelFormat)
             mtkView.delegate = renderer
             context.coordinator.renderer = renderer
+
+            // Wire shader error callback
+            renderer.onShaderError = { [weak mtkView] message in
+                mtkView?.isPaused = true
+                self.audioManager.pause()
+                self.onShaderError?(message)
+            }
         } catch {
             print("Failed to create MilkdropRenderer: \(error)")
         }
@@ -53,12 +63,15 @@ struct MetalVisualizerView: NSViewRepresentable {
         let currentPreset = presetManager.currentPreset
         if currentPreset.name != context.coordinator.lastPresetName {
             context.coordinator.lastPresetName = currentPreset.name
+            // Resume rendering if it was paused from a previous error
+            nsView.isPaused = false
             renderer.loadPreset(currentPreset)
         }
     }
 
     class Coordinator {
         var renderer: MilkdropRenderer?
+        weak var mtkView: MTKView?
         var lastPresetName: String = ""
     }
 }
