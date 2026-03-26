@@ -350,6 +350,9 @@ struct ShaderTestReportView: View {
     let testManager: ShaderTestManager
     let onDismiss: () -> Void
 
+    @State private var expandedPreset: UUID? = nil
+    @State private var selectedShaderType: String = "warp" // "warp" or "comp"
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -409,39 +412,20 @@ struct ShaderTestReportView: View {
                 .padding(.vertical, 4)
             }
 
-            // Failed presets list
+            // Failed presets list with expandable error details
             if !testManager.failedResults.isEmpty {
                 Text("Failed Presets:")
                     .font(.system(.caption, design: .monospaced).bold())
 
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 4) {
+                    LazyVStack(alignment: .leading, spacing: 2) {
                         ForEach(testManager.failedResults) { result in
-                            HStack(spacing: 6) {
-                                Image(systemName: "xmark.circle.fill")
-                                    .foregroundStyle(.red)
-                                    .font(.caption2)
-                                Text(result.presetName)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                                Spacer()
-                                if result.warpResult == .failed {
-                                    Text("warp")
-                                        .font(.system(.caption2, design: .monospaced))
-                                        .foregroundStyle(.red)
-                                        .padding(.horizontal, 4)
-                                        .padding(.vertical, 1)
-                                        .background(.red.opacity(0.15), in: RoundedRectangle(cornerRadius: 3))
-                                }
-                                if result.compResult == .failed {
-                                    Text("comp")
-                                        .font(.system(.caption2, design: .monospaced))
-                                        .foregroundStyle(.red)
-                                        .padding(.horizontal, 4)
-                                        .padding(.vertical, 1)
-                                        .background(.red.opacity(0.15), in: RoundedRectangle(cornerRadius: 3))
-                                }
+                            FailedPresetRow(
+                                result: result,
+                                isExpanded: expandedPreset == result.id,
+                                selectedShaderType: $selectedShaderType
+                            ) {
+                                expandedPreset = expandedPreset == result.id ? nil : result.id
                             }
                         }
                     }
@@ -462,7 +446,7 @@ struct ShaderTestReportView: View {
             }
         }
         .padding()
-        .frame(width: 600, height: 450)
+        .frame(width: 700, height: 550)
     }
 
     private func buildReport() -> String {
@@ -484,10 +468,129 @@ struct ShaderTestReportView: View {
                 if result.warpResult == .failed { tags.append("warp") }
                 if result.compResult == .failed { tags.append("comp") }
                 lines.append("  \(result.presetName) [\(tags.joined(separator: ", "))]")
+                if let err = result.warpError {
+                    lines.append("    [warp error] \(err)")
+                }
+                if let err = result.compError {
+                    lines.append("    [comp error] \(err)")
+                }
             }
         }
 
         return lines.joined(separator: "\n")
+    }
+}
+
+// MARK: - Failed Preset Row
+
+private struct FailedPresetRow: View {
+    let result: ShaderTestResult
+    let isExpanded: Bool
+    @Binding var selectedShaderType: String
+    let onTap: () -> Void
+
+    private var activeError: String? {
+        selectedShaderType == "warp" ? result.warpError : result.compError
+    }
+    private var activeSource: String? {
+        selectedShaderType == "warp" ? result.warpMetalSource : result.compMetalSource
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header row — clickable to expand
+            Button(action: onTap) {
+                HStack(spacing: 6) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 12)
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.red)
+                        .font(.caption2)
+                    Text(result.presetName)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer()
+                    if result.warpResult == .failed {
+                        Text("warp")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.red)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(.red.opacity(0.15), in: RoundedRectangle(cornerRadius: 3))
+                    }
+                    if result.compResult == .failed {
+                        Text("comp")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.red)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(.red.opacity(0.15), in: RoundedRectangle(cornerRadius: 3))
+                    }
+                }
+                .padding(.vertical, 4)
+                .padding(.horizontal, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            // Expanded error detail panel
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 6) {
+                    // Shader type picker (only show if both failed)
+                    if result.warpResult == .failed && result.compResult == .failed {
+                        Picker("Shader", selection: $selectedShaderType) {
+                            Text("Warp").tag("warp")
+                            Text("Comp").tag("comp")
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 160)
+                    }
+
+                    // Error text
+                    if let err = activeError {
+                        Text("Compiler Error:")
+                            .font(.system(.caption2, design: .monospaced).bold())
+                            .foregroundStyle(.red)
+                        ScrollView([.horizontal, .vertical]) {
+                            Text(err)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.red.opacity(0.9))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(height: 80)
+                        .background(Color.red.opacity(0.05), in: RoundedRectangle(cornerRadius: 4))
+                    }
+
+                    // Copy buttons
+                    HStack(spacing: 8) {
+                        if activeError != nil {
+                            Button("Copy Error") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(activeError ?? "", forType: .string)
+                            }
+                            .font(.system(.caption2))
+                        }
+                        if activeSource != nil {
+                            Button("Copy Metal Source") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(activeSource ?? "", forType: .string)
+                            }
+                            .font(.system(.caption2))
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 8)
+                .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 4))
+            }
+        }
     }
 }
 

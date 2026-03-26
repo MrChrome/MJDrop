@@ -23,6 +23,22 @@ struct TranspileResult {
 
 struct ShaderTranspiler {
 
+    // MARK: - Inline Helper Types
+
+    /// Metadata for a multi-statement helper function to be inlined at every call site.
+    private struct InlineHelper {
+        let name: String
+        let returnType: String
+        let paramTypes: [String]
+        let paramNames: [String]
+        let bodyLines: [String]  // individual statements (trimmed, non-empty)
+    }
+
+    private struct HelperCallSite {
+        let range: Range<String.Index>
+        let args: [String]
+    }
+
     // MARK: - Public API
 
     static func transpile(hlsl: String, type: ShaderType, presetName: String) -> TranspileResult? {
@@ -35,8 +51,13 @@ struct ShaderTranspiler {
         // 2. Apply HLSL → Metal transformations
         let transformed = applyTransformations(body)
 
-        // 3. Hoist any inline helper function definitions out of the body
-        let (cleanBody, hoistedFunctions) = extractHelperFunctions(from: transformed)
+        // 3. Extract helper function definitions; single-expression ones become #define macros,
+        //    multi-statement ones are collected for inline expansion at call sites.
+        let (cleanBody, hoistedFunctions, inlineHelpers) = extractHelperFunctions(from: transformed)
+
+        // 3b. Inline-expand multi-statement helper calls (Metal has no lambdas, so we can't
+        //     use the [&](...) -> T { ... }(args) pattern — instead we emit scoped blocks).
+        let expandedBody = inlineExpandHelperCalls(cleanBody, helpers: inlineHelpers)
 
         // 4. Generate a stable function name
         let safeName = presetName
@@ -45,7 +66,7 @@ struct ShaderTranspiler {
         let funcName = "v2_\(type == .warp ? "warp" : "comp")_\(safeName)"
 
         // 5. Wrap in Metal function with preamble
-        let metalSource = buildMetalSource(body: cleanBody, type: type, functionName: funcName, hoistedFunctions: hoistedFunctions)
+        let metalSource = buildMetalSource(body: expandedBody, type: type, functionName: funcName, hoistedFunctions: hoistedFunctions)
 
         return TranspileResult(metalSource: metalSource, functionName: funcName)
     }
@@ -119,6 +140,26 @@ struct ShaderTranspiler {
 
     // MARK: - HLSL → Metal Transformations
 
+    /// Returns true if a `float[N] <varName>` declaration exists at brace depth 0 in `source`.
+    /// Ignores declarations buried inside function bodies (depth > 0), which is critical because
+    /// `extractHelperFunctions` removes those bodies — so a declaration inside a helper function
+    /// must NOT suppress injection of an outer-scope declaration.
+    private static func declaredAtTopLevel(_ varName: String, in source: String) -> Bool {
+        let escaped = NSRegularExpression.escapedPattern(for: varName)
+        guard let regex = try? NSRegularExpression(pattern: "float[234]?\\s+\(escaped)\\b") else { return false }
+        var depth = 0
+        for line in source.components(separatedBy: "\n") {
+            if depth == 0 {
+                let ns = line as NSString
+                if regex.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) != nil {
+                    return true
+                }
+            }
+            depth += line.filter { $0 == "{" }.count - line.filter { $0 == "}" }.count
+        }
+        return false
+    }
+
     private static func applyTransformations(_ body: String) -> String {
         var s = body
 
@@ -141,9 +182,9 @@ struct ShaderTranspiler {
         s = s.replacingOccurrences(of: #"\bslow_roam_sin\b"#, with: "roam_sin", options: .regularExpression)
 
         // hue_shader — undeclared float3 variable some presets reference but never define
-        // Insert a declaration if used but not declared
+        // Insert a declaration if used but not declared at the top level
         if s.range(of: #"\bhue_shader\b"#, options: .regularExpression) != nil &&
-           s.range(of: #"float[234]?\s+hue_shader\b"#, options: .regularExpression) == nil {
+           !declaredAtTopLevel("hue_shader", in: s) {
             s = "float3 hue_shader = float3(1.0);\n" + s
         }
 
@@ -155,20 +196,21 @@ struct ShaderTranspiler {
 
         // Undeclared variable `anz` (typo for `ang` in some presets) — declare it
         if s.range(of: #"\banz\b"#, options: .regularExpression) != nil &&
-           s.range(of: #"float[234]?\s+anz\b"#, options: .regularExpression) == nil {
+           !declaredAtTopLevel("anz", in: s) {
             s = "float anz = 0.0;\n" + s
         }
 
         // `vol` — used in some presets as a local average-volume variable.
-        // If used but not declared, insert a declaration at the top of the body.
+        // If used but not declared at top level, insert a declaration.
         if s.range(of: #"\bvol\b"#, options: .regularExpression) != nil &&
-           s.range(of: #"float[234]?\s+vol\b"#, options: .regularExpression) == nil {
+           !declaredAtTopLevel("vol", in: s) {
             s = "float vol = (bass + mid + treb) * 0.333333;\n" + s
         }
 
         // `uv2` — some presets use a second UV coordinate that isn't declared.
+        // Use top-level check so declarations inside helper function bodies are ignored.
         if s.range(of: #"\buv2\b"#, options: .regularExpression) != nil &&
-           s.range(of: #"float[234]?\s+uv2\b"#, options: .regularExpression) == nil {
+           !declaredAtTopLevel("uv2", in: s) {
             s = "float2 uv2 = uv;\n" + s
         }
 
@@ -176,7 +218,7 @@ struct ShaderTranspiler {
         // — blur range uniforms that some presets reference. Provide safe defaults if missing.
         for blurVar in ["blur1_min", "blur1_max", "blur2_min", "blur2_max", "blur3_min", "blur3_max"] {
             if s.range(of: "\\b\(blurVar)\\b", options: .regularExpression) != nil &&
-               s.range(of: "float[234]?\\s+\(blurVar)\\b", options: .regularExpression) == nil {
+               !declaredAtTopLevel(blurVar, in: s) {
                 let defaultVal = blurVar.hasSuffix("_min") ? "0.0" : "1.0"
                 s = "float \(blurVar) = \(defaultVal);\n" + s
             }
@@ -184,7 +226,7 @@ struct ShaderTranspiler {
 
         // `sw2` — undefined float used in some presets, likely a wave switch variable. Default to 0.
         if s.range(of: #"\bsw2\b"#, options: .regularExpression) != nil &&
-           s.range(of: #"float[234]?\s+sw2\b"#, options: .regularExpression) == nil {
+           !declaredAtTopLevel("sw2", in: s) {
             s = "float sw2 = 0.0;\n" + s
         }
 
@@ -305,10 +347,10 @@ struct ShaderTranspiler {
             options: .regularExpression
         )
 
-        // lum(x) → _md_lum(x)
+        // lum(x) → _md_lum(x)  — only rename the function call, not variable declarations
         s = s.replacingOccurrences(
-            of: #"\blum\b"#,
-            with: "_md_lum",
+            of: #"\blum\s*\("#,
+            with: "_md_lum(",
             options: .regularExpression
         )
 
@@ -339,6 +381,11 @@ struct ShaderTranspiler {
         // When these appear in arithmetic without a swizzle, HLSL auto-truncates.
         // We handle this by inserting explicit swizzles where needed.
         s = fixImplicitTruncation(s)
+
+        // Second redundant-swizzle pass: fixBlurMacrosInScalarContext (inside fixImplicitTruncation)
+        // appends `.x` to each _md_GetBlurN call, which can leave the outer `(x - x).x` pattern.
+        // That outer swizzle on a scalar is now redundant and illegal — strip it.
+        s = fixRedundantScalarSwizzle(s)
 
         // Convert HLSL `%` modulo operator to Metal `fmod()`.
         // HLSL allows `%` on float operands; Metal requires `fmod()`.
@@ -412,6 +459,11 @@ struct ShaderTranspiler {
     /// `sampler_fw_main` → ("main", "fw")
     /// `sampler_pc_noise_lq` → ("noise_lq", "pc")
     private static func parseSamplerName(_ name: String) -> (texName: String, sampMode: String) {
+        let knownTextures: Set<String> = [
+            "main", "blur1", "blur2", "blur3",
+            "noise_lq", "noise_mq", "noise_hq",
+            "noisevol_lq", "noisevol_hq"
+        ]
         var rest = name
         if rest.hasPrefix("sampler_") {
             rest = String(rest.dropFirst("sampler_".count))
@@ -422,12 +474,16 @@ struct ShaderTranspiler {
         for mode in modes {
             if rest.hasPrefix(mode) {
                 let texName = String(rest.dropFirst(mode.count))
-                return (texName, String(mode.dropLast()))
+                // Unknown user textures (e.g. sampler_pic) fall back to main
+                let finalTex = knownTextures.contains(texName) ? texName : "main"
+                return (finalTex, String(mode.dropLast()))
             }
         }
 
         // No mode prefix — default to fw (linear filter, wrap)
-        return (rest, "fw")
+        // Unknown user textures fall back to main
+        let finalTex = knownTextures.contains(rest) ? rest : "main"
+        return (finalTex, "fw")
     }
 
     // MARK: - mul() Transformation
@@ -499,33 +555,24 @@ struct ShaderTranspiler {
                 combined += " " + lines[stmtEnd].trimmingCharacters(in: .whitespaces)
             }
 
-            // Check if the RHS ends with .xyz before the semicolon
-            let beforeSemicolon = combined.components(separatedBy: ";").first ?? combined
-            let rhsTrimmed = beforeSemicolon.trimmingCharacters(in: .whitespaces)
-            if rhsTrimmed.hasSuffix(".xyz") {
-                switch declType {
-                case "float4":
-                    // float4 = ...xyz → downgrade decl to float3
+            // For float2/float LHS, replace ALL .xyz in the statement (including mid-expression
+            // and multi-line continuations). HLSL tex2D returns float4 and presets rely on
+            // implicit truncation; our transpiler appends .xyz, but float2/float contexts need .xy/.x.
+            switch declType {
+            case "float2":
+                for j in i...stmtEnd {
+                    lines[j] = lines[j].replacingOccurrences(of: ".xyz", with: ".xy")
+                }
+            case "float":
+                for j in i...stmtEnd {
+                    lines[j] = lines[j].replacingOccurrences(of: ".xyz", with: ".x")
+                }
+            default:
+                // For float4 LHS: downgrade type to float3 when RHS ends with .xyz
+                let beforeSemicolon = combined.components(separatedBy: ";").first ?? combined
+                let rhsTrimmed = beforeSemicolon.trimmingCharacters(in: .whitespaces)
+                if rhsTrimmed.hasSuffix(".xyz") && declType == "float4" {
                     lines[i] = lines[i].replacingOccurrences(of: "float4 ", with: "float3 ", options: [], range: lines[i].range(of: "float4 "))
-                case "float2":
-                    // float2 = ...xyz → change swizzle to .xy
-                    // Find the last .xyz on the statement's last line and replace it
-                    for j in stride(from: stmtEnd, through: i, by: -1) {
-                        if let range = lines[j].range(of: ".xyz", options: .backwards) {
-                            lines[j] = lines[j].replacingCharacters(in: range, with: ".xy")
-                            break
-                        }
-                    }
-                case "float":
-                    // float = ...xyz → change swizzle to .x
-                    for j in stride(from: stmtEnd, through: i, by: -1) {
-                        if let range = lines[j].range(of: ".xyz", options: .backwards) {
-                            lines[j] = lines[j].replacingCharacters(in: range, with: ".x")
-                            break
-                        }
-                    }
-                default:
-                    break
                 }
             }
 
@@ -917,20 +964,30 @@ struct ShaderTranspiler {
                     if isSoleRhs {
                         // Now check: is the LHS a float3 declaration or a known float3 variable?
                         // Walk left from the `=` to find the LHS token
+                        let float3Vars: Set<String> = ["ret", "ret1", "ret2", "color", "bloom", "col", "c", "c2", "c3", "rgb", "hsv", "n", "glow"]
                         var lhsEnd = prevIdx - 1
                         while lhsEnd >= 0 && (chars[lhsEnd] == " " || chars[lhsEnd] == "\t") { lhsEnd -= 1 }
-                        var lhsStart = lhsEnd
-                        while lhsStart > 0 && (chars[lhsStart-1].isLetter || chars[lhsStart-1].isNumber || chars[lhsStart-1] == "_") { lhsStart -= 1 }
-                        let lhsVarName = String(chars[lhsStart...lhsEnd])
-                        // Check for `float3 varname =` — look further left for "float3"
-                        var typeEnd = lhsStart - 1
-                        while typeEnd >= 0 && (chars[typeEnd] == " " || chars[typeEnd] == "\t") { typeEnd -= 1 }
-                        var typeStart = typeEnd
-                        while typeStart > 0 && (chars[typeStart-1].isLetter || chars[typeStart-1].isNumber || chars[typeStart-1] == "_") { typeStart -= 1 }
-                        let typeName = typeStart <= typeEnd ? String(chars[typeStart...typeEnd]) : ""
-                        // Known float3 variables that receive blur results without truncation
-                        let float3Vars: Set<String> = ["ret", "ret1", "ret2", "color", "bloom", "col", "c", "c2", "c3", "rgb", "hsv", "n", "glow"]
-                        skipForFloat3 = typeName == "float3" || float3Vars.contains(lhsVarName)
+                        if lhsEnd < 0 {
+                            // prevIdx was 0 — no LHS token before `=`, can't determine type safely
+                            skipForFloat3 = false
+                        } else {
+                            var lhsStart = lhsEnd
+                            while lhsStart > 0 && (chars[lhsStart-1].isLetter || chars[lhsStart-1].isNumber || chars[lhsStart-1] == "_") { lhsStart -= 1 }
+                            let lhsVarName = String(chars[lhsStart...lhsEnd])
+                            // Check for `float3 varname =` — look further left for "float3"
+                            let typeEnd0 = lhsStart - 1
+                            if typeEnd0 < 0 {
+                                // No room for a type keyword — rely on known variable names only
+                                skipForFloat3 = float3Vars.contains(lhsVarName)
+                            } else {
+                                var typeEnd = typeEnd0
+                                while typeEnd >= 0 && (chars[typeEnd] == " " || chars[typeEnd] == "\t") { typeEnd -= 1 }
+                                var typeStart = typeEnd
+                                while typeStart > 0 && (chars[typeStart-1].isLetter || chars[typeStart-1].isNumber || chars[typeStart-1] == "_") { typeStart -= 1 }
+                                let typeName = typeStart <= typeEnd ? String(chars[typeStart...typeEnd]) : ""
+                                skipForFloat3 = typeName == "float3" || float3Vars.contains(lhsVarName)
+                            }
+                        }
                     } else {
                         skipForFloat3 = false
                     }
@@ -1251,7 +1308,115 @@ struct ShaderTranspiler {
             lines[lineIdx] = line
         }
 
-        return lines.joined(separator: "\n")
+        let intermediate = lines.joined(separator: "\n")
+        // Also fix float3 vars inside 2D texture sample UV arguments.
+        // tex2D UV must be float2; float3 vars in the UV arg need .xy.
+        return fixFloat3InSample2DUV(intermediate, float3Vars: float3Vars)
+    }
+
+    /// Fix float3 variables that appear in the UV argument of texture2d sample calls.
+    /// The UV for a 2d texture must be float2, so any unswizzled float3 var needs `.xy`.
+    /// 3D textures (names containing "vol") are skipped since their UV is float3.
+    private static func fixFloat3InSample2DUV(_ source: String, float3Vars: Set<String>) -> String {
+        guard source.contains(".sample(") else { return source }
+
+        let targetStr = ".sample("
+        let targetChars = Array(targetStr)
+        let targetLen = targetChars.count
+
+        var chars = Array(source)
+        let n = chars.count
+        var result: [Character] = []
+        result.reserveCapacity(n)
+        var i = 0
+
+        while i < n {
+            // Try to match ".sample(" at position i
+            guard i + targetLen <= n && chars[i..<(i + targetLen)].elementsEqual(targetChars) else {
+                result.append(chars[i])
+                i += 1
+                continue
+            }
+
+            // Find the texture name immediately before the '.'
+            var tnEnd = i - 1
+            while tnEnd >= 0 && (chars[tnEnd].isLetter || chars[tnEnd].isNumber || chars[tnEnd] == "_") {
+                tnEnd -= 1
+            }
+            let texNameStart = tnEnd + 1
+            let texName = texNameStart < i ? String(chars[texNameStart..<i]) : ""
+
+            // Append ".sample(" and advance
+            result.append(contentsOf: targetChars)
+            i += targetLen
+
+            // 3D textures have float3 UVs — skip them
+            if texName.contains("vol") { continue }
+
+            // depth = 1 since we're inside the opening '(' of sample(...)
+            var depth = 1
+
+            // Pass 1: copy the sampler argument (up to the first ',' at depth 1)
+            var foundComma = false
+            while i < n && !foundComma {
+                let c = chars[i]
+                if c == "(" { depth += 1 }
+                else if c == ")" {
+                    depth -= 1
+                    if depth == 0 {
+                        // sample() closed with no UV arg (shouldn't happen in valid shaders)
+                        result.append(c)
+                        i += 1
+                        break
+                    }
+                }
+                if depth == 1 && c == "," {
+                    result.append(c)
+                    i += 1
+                    foundComma = true
+                } else {
+                    result.append(c)
+                    i += 1
+                }
+            }
+            if !foundComma || depth == 0 { continue }
+
+            // Pass 2: extract the UV expression until the closing ')' at depth 0
+            var uvChars: [Character] = []
+            while i < n {
+                let c = chars[i]
+                if c == "(" { depth += 1 }
+                else if c == ")" {
+                    depth -= 1
+                    if depth == 0 { break }
+                }
+                uvChars.append(c)
+                i += 1
+            }
+
+            // Fix: add .xy to any unswizzled float3 var inside the UV expression
+            var uvExpr = String(uvChars)
+            for f3var in float3Vars {
+                let escapedVar = NSRegularExpression.escapedPattern(for: f3var)
+                let pat = "\\b\(escapedVar)\\b(?!\\s*[.\\[=])"
+                if let regex = try? NSRegularExpression(pattern: pat) {
+                    let ns = uvExpr as NSString
+                    let matches = regex.matches(in: uvExpr, range: NSRange(location: 0, length: ns.length))
+                    for m in matches.reversed() {
+                        uvExpr = (uvExpr as NSString).replacingCharacters(in: m.range, with: "\(f3var).xy")
+                    }
+                }
+            }
+            result.append(contentsOf: uvExpr)
+
+            // Append the closing ')' of sample()
+            if i < n && chars[i] == ")" {
+                result.append(")")
+                i += 1
+            }
+        }
+
+        return String(result)
     }
 
     // MARK: - HLSL Modulo → fmod()
@@ -1686,6 +1851,17 @@ struct ShaderTranspiler {
     }
 
     private static func stripScalarSwizzleOnParens(_ source: String) -> String {
+        // Functions that ALWAYS return a float scalar regardless of argument type.
+        // A `.x` swizzle on their result is always illegal in Metal.
+        let scalarReturnFunctions: Set<String> = [
+            "length", "dot", "distance",
+            "abs", "sign", "floor", "ceil", "round", "trunc", "fract",
+            "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+            "exp", "exp2", "log", "log2", "sqrt", "rsqrt",
+            "saturate", "pow", "fmod", "clamp", "min", "max",
+            "step", "smoothstep", "_md_lum"
+        ]
+
         var result = ""
         let chars = Array(source)
         var i = 0
@@ -1705,13 +1881,33 @@ struct ShaderTranspiler {
                         if depth > 0 { j -= 1 }
                     }
                     if j >= 0 {
-                        // Extract the content between ( and )
-                        let inner = String(chars[(j+1)..<i])
-                        // Check if the inner expression is scalar-valued:
-                        // It's scalar if ALL texture/blur samples have a single-component swizzle,
-                        // and there are no bare float2/float3 constructors or vec variables.
-                        if isScalarExpression(inner) {
-                            // Remove the `.X` suffix — skip i, i+1, i+2
+                        // Check for a function name immediately before the `(`
+                        var fnEnd = j - 1
+                        while fnEnd >= 0 && (chars[fnEnd] == " " || chars[fnEnd] == "\t") { fnEnd -= 1 }
+                        let hasFuncName = fnEnd >= 0 &&
+                            (chars[fnEnd].isLetter || chars[fnEnd].isNumber || chars[fnEnd] == "_")
+
+                        var shouldStrip = false
+                        if hasFuncName {
+                            // It's a function call — only strip if the function is known to
+                            // return a scalar. For unknown functions (e.g. _md_GetBlur1, tex.sample)
+                            // the result may be a vector, so keep the swizzle.
+                            var fnStart = fnEnd
+                            while fnStart > 0 &&
+                                (chars[fnStart-1].isLetter || chars[fnStart-1].isNumber || chars[fnStart-1] == "_") {
+                                fnStart -= 1
+                            }
+                            let funcName = String(chars[fnStart...fnEnd])
+                            shouldStrip = scalarReturnFunctions.contains(funcName)
+                        } else {
+                            // No function name — it's a parenthesized expression `(expr).x`.
+                            // Check if the inner expression is provably scalar (all sub-calls
+                            // already swizzled to single components, no bare vector constructors).
+                            let inner = String(chars[(j+1)..<i])
+                            shouldStrip = isScalarExpression(inner)
+                        }
+
+                        if shouldStrip {
                             result.append(")")
                             i += 3 // skip ), ., component
                             continue
@@ -1798,85 +1994,89 @@ struct ShaderTranspiler {
 
     // MARK: - Metal Source Generation
 
-    // MARK: - Helper Function → Macro Conversion
+    // MARK: - Helper Function Extraction & Inline Expansion
 
-    /// Detects inline function definitions in the shader body (e.g. `float3 Get1(float2 uvi) { ... }`)
-    /// and converts them to preprocessor macros, since Metal doesn't allow nested function definitions.
-    /// These helpers often reference textures/samplers from the enclosing fragment scope, so they
-    /// can't simply be hoisted — macros expand inline and inherit the calling scope.
-    /// Returns (body with functions replaced by macros, array of #define strings to place before body).
-    private static func extractHelperFunctions(from body: String) -> (body: String, hoisted: [String]) {
-        var macros: [String] = []
-        var cleanLines: [String] = []
+    /// Detects inline function definitions in the shader body (e.g. `float3 Get1(float2 uvi) { ... }`).
+    /// Single-expression bodies become simple `#define` macros (no lambda needed).
+    /// Multi-statement bodies are returned as `InlineHelper` structs — Metal doesn't support C++
+    /// lambdas so the old `[&](...) -> T { body }(args)` IIFE pattern is invalid.
+    private static func extractHelperFunctions(from body: String) -> (body: String, hoisted: [String], inlineHelpers: [InlineHelper]) {
+        var macros:  [String]       = []
+        var helpers: [InlineHelper] = []
+        var cleanLines: [String]    = []
 
         let lines = body.components(separatedBy: "\n")
         var i = 0
 
-        // Pattern: type name(params) { ... }
-        // Matches: float3 Get1 (float2 uvi) {
+        // Pattern: type name(params) {
         let funcDefPattern = #"^\s*(float[234]?|int|void|bool|half[234]?)\s+([a-zA-Z_]\w*)\s*\(([^)]*)\)\s*\{"#
         let funcDefRegex = try? NSRegularExpression(pattern: funcDefPattern)
 
         while i < lines.count {
-            let line = lines[i]
+            let line  = lines[i]
             let nsLine = line as NSString
             let match = funcDefRegex?.firstMatch(in: line, range: NSRange(location: 0, length: nsLine.length))
 
             if let match, match.numberOfRanges >= 4 {
                 let returnType = nsLine.substring(with: match.range(at: 1))
-                let funcName = nsLine.substring(with: match.range(at: 2))
-                let paramsRaw = nsLine.substring(with: match.range(at: 3))
+                let funcName   = nsLine.substring(with: match.range(at: 2))
+                let paramsRaw  = nsLine.substring(with: match.range(at: 3))
 
-                // Collect the full function body until matching close brace
-                var funcSource = line
-                var braceDepth = 0
-                for ch in line { if ch == "{" { braceDepth += 1 } else if ch == "}" { braceDepth -= 1 } }
-
+                // Collect full function source until braces balance
+                var funcSource  = line
+                var braceDepth  = line.filter { $0 == "{" }.count - line.filter { $0 == "}" }.count
                 var j = i + 1
                 while braceDepth > 0 && j < lines.count {
                     funcSource += "\n" + lines[j]
-                    for ch in lines[j] { if ch == "{" { braceDepth += 1 } else if ch == "}" { braceDepth -= 1 } }
+                    braceDepth += lines[j].filter { $0 == "{" }.count - lines[j].filter { $0 == "}" }.count
                     j += 1
                 }
 
-                // Extract just the body between { and }
-                if let openBrace = funcSource.firstIndex(of: "{"),
+                if let openBrace  = funcSource.firstIndex(of: "{"),
                    let closeBrace = funcSource.lastIndex(of: "}") {
-                    var innerBody = String(funcSource[funcSource.index(after: openBrace)..<closeBrace])
+                    let innerBody = String(funcSource[funcSource.index(after: openBrace)..<closeBrace])
                         .trimmingCharacters(in: .whitespacesAndNewlines)
 
-                    // Parse parameter names for macro args
-                    let paramNames = paramsRaw.components(separatedBy: ",").compactMap { param -> String? in
-                        let trimmed = param.trimmingCharacters(in: .whitespaces)
-                        // "float2 uvi" → "uvi"
-                        let parts = trimmed.components(separatedBy: .whitespaces)
-                        return parts.last.flatMap { $0.isEmpty ? nil : $0 }
+                    // Parse parameter types and names
+                    var paramTypes: [String] = []
+                    var paramNames: [String] = []
+                    for param in paramsRaw.components(separatedBy: ",") {
+                        let parts = param.trimmingCharacters(in: .whitespaces)
+                            .components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                        if parts.count >= 2 {
+                            paramTypes.append(parts.dropLast().joined(separator: " "))
+                            paramNames.append(parts.last!)
+                        } else if let only = parts.first, !only.isEmpty {
+                            paramTypes.append("float")
+                            paramNames.append(only)
+                        }
                     }
-
-                    // If body is a single `return expr;` statement, extract just the expr
-                    let returnPattern = #"^\s*return\s+(.*?)\s*;\s*$"#
-                    if let returnRegex = try? NSRegularExpression(pattern: returnPattern, options: .dotMatchesLineSeparators),
-                       let returnMatch = returnRegex.firstMatch(in: innerBody, range: NSRange(location: 0, length: (innerBody as NSString).length)) {
-                        innerBody = (innerBody as NSString).substring(with: returnMatch.range(at: 1))
-                    }
-
-                    // For multi-statement bodies, wrap in a lambda
                     let macroArgs = paramNames.joined(separator: ", ")
-                    let hasSemicolon = innerBody.contains(";")
 
-                    if hasSemicolon {
-                        // Multi-statement: use a lambda that captures by reference
-                        // [&](<params>) -> type { <body> }
-                        let lambdaParams = zip(paramsRaw.components(separatedBy: ","), paramNames).map { raw, _ in
-                            raw.trimmingCharacters(in: .whitespaces)
-                        }.joined(separator: ", ")
-                        macros.append("#define \(funcName)(\(macroArgs)) [&](\(lambdaParams)) -> \(returnType) { \(innerBody) }(\(macroArgs))")
+                    // Detect single-return body: the entire body is `return <expr>;`
+                    let singleReturnPat = #"^\s*return\s+(.*?)\s*;\s*$"#
+                    var singleExpr: String? = nil
+                    if let rx = try? NSRegularExpression(pattern: singleReturnPat, options: .dotMatchesLineSeparators),
+                       let m = rx.firstMatch(in: innerBody, range: NSRange(innerBody.startIndex..., in: innerBody)) {
+                        let candidate = (innerBody as NSString).substring(with: m.range(at: 1))
+                        if !candidate.contains(";") { singleExpr = candidate }
+                    }
+
+                    if let expr = singleExpr {
+                        // Single expression: safe as a simple #define (no lambda)
+                        macros.append("#define \(funcName)(\(macroArgs)) (\(returnType))(\(expr))")
                     } else {
-                        // Single expression: simple macro
-                        macros.append("#define \(funcName)(\(macroArgs)) (\(returnType))(\(innerBody))")
+                        // Multi-statement: store for inline expansion at call sites
+                        let bodyLines = innerBody
+                            .components(separatedBy: "\n")
+                            .map { $0.trimmingCharacters(in: .whitespaces) }
+                            .filter { !$0.isEmpty }
+                        helpers.append(InlineHelper(
+                            name: funcName, returnType: returnType,
+                            paramTypes: paramTypes, paramNames: paramNames,
+                            bodyLines: bodyLines))
                     }
                 }
-
                 i = j
             } else {
                 cleanLines.append(line)
@@ -1884,7 +2084,154 @@ struct ShaderTranspiler {
             }
         }
 
-        return (cleanLines.joined(separator: "\n"), macros)
+        return (cleanLines.joined(separator: "\n"), macros, helpers)
+    }
+
+    // MARK: - Inline Helper Expansion
+
+    /// Replaces every call to a multi-statement helper with an anonymous-block inline expansion.
+    /// Metal doesn't support C++ lambdas, but it does support anonymous scoped blocks (`{ }`),
+    /// which naturally inherit all outer-scope variables without extra parameters.
+    private static func inlineExpandHelperCalls(_ body: String, helpers: [InlineHelper]) -> String {
+        if helpers.isEmpty { return body }
+        var lines = body.components(separatedBy: "\n")
+        var counter = 0
+
+        for helper in helpers {
+            var processed: [String] = []
+            for line in lines {
+                guard line.contains(helper.name) else { processed.append(line); continue }
+
+                var expandedBlocks: [String] = []
+                var currentLine = line
+                var guard2 = 0
+                while guard2 < 20, let call = findNextHelperCall(in: currentLine, funcName: helper.name) {
+                    guard2 += 1
+                    let id = counter; counter += 1
+                    let (blockLines, resultVar) = makeInlineBlock(helper: helper, args: call.args, id: id)
+                    expandedBlocks.append(contentsOf: blockLines)
+                    currentLine = String(currentLine[..<call.range.lowerBound])
+                                + resultVar
+                                + String(currentLine[call.range.upperBound...])
+                }
+                processed.append(contentsOf: expandedBlocks)
+                processed.append(currentLine)
+            }
+            lines = processed
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Finds the first well-formed call to `funcName(...)` in `line` (word-boundary-aware,
+    /// balanced parens).  Returns the full call range and the split argument list.
+    private static func findNextHelperCall(in line: String, funcName: String) -> HelperCallSite? {
+        var searchIdx = line.startIndex
+        while searchIdx < line.endIndex {
+            guard let nameRange = line.range(of: funcName, range: searchIdx..<line.endIndex) else { return nil }
+
+            let prevOK: Bool = nameRange.lowerBound == line.startIndex ? true : {
+                let prev = line[line.index(before: nameRange.lowerBound)]
+                return !prev.isLetter && !prev.isNumber && prev != "_"
+            }()
+            let afterOK: Bool = nameRange.upperBound >= line.endIndex ? true : {
+                let next = line[nameRange.upperBound]
+                return !next.isLetter && !next.isNumber && next != "_"
+            }()
+
+            if prevOK && afterOK {
+                var parenIdx = nameRange.upperBound
+                while parenIdx < line.endIndex && line[parenIdx] == " " { parenIdx = line.index(after: parenIdx) }
+                if parenIdx < line.endIndex && line[parenIdx] == "(" {
+                    var depth = 1
+                    var idx = line.index(after: parenIdx)
+                    while idx < line.endIndex && depth > 0 {
+                        if line[idx] == "(" { depth += 1 }
+                        else if line[idx] == ")" { depth -= 1; if depth == 0 { break } }
+                        idx = line.index(after: idx)
+                    }
+                    let argsStr = String(line[line.index(after: parenIdx)..<idx])
+                    let callEnd = line.index(after: idx)
+                    return HelperCallSite(range: nameRange.lowerBound..<callEnd,
+                                         args: splitTopLevelCommas(argsStr))
+                }
+            }
+            searchIdx = line.index(after: nameRange.lowerBound)
+        }
+        return nil
+    }
+
+    /// Splits a top-level-comma-separated argument string (ignores commas inside parens/brackets).
+    private static func splitTopLevelCommas(_ s: String) -> [String] {
+        let t = s.trimmingCharacters(in: .whitespaces)
+        if t.isEmpty { return [] }
+        var result: [String] = []; var current = ""; var depth = 0
+        for c in t {
+            switch c {
+            case "(", "[": depth += 1; current.append(c)
+            case ")", "]": depth -= 1; current.append(c)
+            case "," where depth == 0: result.append(current); current = ""
+            default: current.append(c)
+            }
+        }
+        result.append(current)
+        return result
+    }
+
+    /// Generates the anonymous-block inline expansion for a single helper call.
+    ///
+    ///   ReturnType _md_Name_N_ret;
+    ///   { ParamType _md_Name_N_p = (arg); <renamed body>; _md_Name_N_ret = returnExpr; }
+    private static func makeInlineBlock(helper: InlineHelper, args: [String], id: Int) -> (lines: [String], resultVar: String) {
+        let prefix    = "_md_\(helper.name)_\(id)"
+        let resultVar = "\(prefix)_ret"
+        var out: [String] = []
+
+        // Collect local variable names from body for renaming (handles comma-decls like `float2 a, b;`)
+        var localVars: [String] = []
+        let declPat = #"^\s*(?:float[234]?|int|bool|half[234]?|uint)\s+([\w ,]+?)(?:\s*=|\s*;)"#
+        if let rx = try? NSRegularExpression(pattern: declPat) {
+            for bLine in helper.bodyLines {
+                let ns = bLine as NSString
+                if let m = rx.firstMatch(in: bLine, range: NSRange(location: 0, length: ns.length)),
+                   m.numberOfRanges >= 2 {
+                    for part in (ns.substring(with: m.range(at: 1))).components(separatedBy: ",") {
+                        let vn = part.trimmingCharacters(in: .whitespaces)
+                        if !vn.isEmpty { localVars.append(vn) }
+                    }
+                }
+            }
+        }
+
+        // Build rename table, longer names first (prevents partial replacements)
+        var renames: [(String, String)] = []
+        for p in helper.paramNames { renames.append((p, "\(prefix)_\(p)")) }
+        for lv in localVars where !helper.paramNames.contains(lv) { renames.append((lv, "\(prefix)_\(lv)")) }
+        renames.sort { $0.0.count > $1.0.count }
+
+        if helper.returnType != "void" { out.append("\(helper.returnType) \(resultVar);") }
+        out.append("{")
+        for (idx, (pType, pName)) in zip(helper.paramTypes, helper.paramNames).enumerated() {
+            let argExpr = idx < args.count ? args[idx].trimmingCharacters(in: .whitespaces) : "0"
+            out.append("    \(pType) \(prefix)_\(pName) = (\(argExpr));")
+        }
+        for bLine in helper.bodyLines {
+            var stmt = bLine
+            for (from, to) in renames {
+                stmt = stmt.replacingOccurrences(
+                    of: #"\b\#(NSRegularExpression.escapedPattern(for: from))\b"#,
+                    with: to, options: .regularExpression)
+            }
+            let t = stmt.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("return ") {
+                var expr = String(t.dropFirst(7)).trimmingCharacters(in: .whitespaces)
+                if expr.hasSuffix(";") { expr = String(expr.dropLast()).trimmingCharacters(in: .whitespaces) }
+                out.append("    \(resultVar) = \(expr);")
+            } else {
+                out.append("    \(stmt)")
+            }
+        }
+        out.append("}")
+        return (out, resultVar)
     }
 
     private static func buildMetalSource(body: String, type: ShaderType, functionName: String, hoistedFunctions: [String] = []) -> String {

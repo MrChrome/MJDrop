@@ -15,6 +15,10 @@ struct ShaderTestResult: Identifiable {
     let presetName: String
     let warpResult: ShaderTestOutcome
     let compResult: ShaderTestOutcome
+    let warpError: String?       // Metal compiler error for warp shader, if failed
+    let compError: String?       // Metal compiler error for comp shader, if failed
+    let warpMetalSource: String? // Generated Metal source for warp, populated on failure
+    let compMetalSource: String? // Generated Metal source for comp, populated on failure
 
     var passed: Bool {
         warpResult != .failed && compResult != .failed
@@ -106,6 +110,10 @@ final class ShaderTestManager {
     private nonisolated static func testPreset(_ preset: PresetParameters, index: Int, pipeline: RenderPipeline) -> ShaderTestResult {
         var warpOutcome: ShaderTestResult.ShaderTestOutcome = .skipped
         var compOutcome: ShaderTestResult.ShaderTestOutcome = .skipped
+        var warpError: String? = nil
+        var compError: String? = nil
+        var warpMetalSource: String? = nil
+        var compMetalSource: String? = nil
 
         if preset.psVersion >= 2 {
             // Use unique name per preset to avoid function name collisions
@@ -117,7 +125,13 @@ final class ShaderTestManager {
                 let compResult = pipeline.compileV2WarpPipeline(
                     metalSource: transpiled.metalSource, functionName: transpiled.functionName
                 )
-                warpOutcome = compResult.pipeline != nil ? .passed : .failed
+                if compResult.pipeline != nil {
+                    warpOutcome = .passed
+                } else {
+                    warpOutcome = .failed
+                    warpError = compResult.error
+                    warpMetalSource = transpiled.metalSource
+                }
             }
 
             // Test composite shader
@@ -126,14 +140,24 @@ final class ShaderTestManager {
                 let compResult = pipeline.compileV2CompPipeline(
                     metalSource: transpiled.metalSource, functionName: transpiled.functionName
                 )
-                compOutcome = compResult.pipeline != nil ? .passed : .failed
+                if compResult.pipeline != nil {
+                    compOutcome = .passed
+                } else {
+                    compOutcome = .failed
+                    compError = compResult.error
+                    compMetalSource = transpiled.metalSource
+                }
             }
         }
 
         return ShaderTestResult(
             presetName: preset.name,
             warpResult: warpOutcome,
-            compResult: compOutcome
+            compResult: compOutcome,
+            warpError: warpError,
+            compError: compError,
+            warpMetalSource: warpMetalSource,
+            compMetalSource: compMetalSource
         )
     }
 }
