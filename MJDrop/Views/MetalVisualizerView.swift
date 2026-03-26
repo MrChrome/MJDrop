@@ -13,7 +13,7 @@ struct MetalVisualizerView: NSViewRepresentable {
     let audioManager: AudioPlayerManager
     let presetManager: PresetManager
     @Binding var isRendererPaused: Bool
-    var onShaderError: ((String) -> Void)?
+    var onShaderError: ((String) -> Bool)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -42,9 +42,13 @@ struct MetalVisualizerView: NSViewRepresentable {
 
             // Wire shader error callback
             renderer.onShaderError = { [weak mtkView] message in
-                mtkView?.isPaused = true
-                self.isRendererPaused = true
-                self.onShaderError?(message)
+                // onShaderError returns true if the error was shown (checkbox is on),
+                // in which case we pause. Otherwise skip to the next preset silently.
+                let errorWasShown = self.onShaderError?(message) ?? false
+                if errorWasShown {
+                    mtkView?.isPaused = true
+                    self.isRendererPaused = true
+                }
             }
         } catch {
             print("Failed to create MilkdropRenderer: \(error)")

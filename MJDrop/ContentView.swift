@@ -27,10 +27,15 @@ struct ContentView: View {
         VStack(spacing: 0) {
             // Milkdrop visualizer
             MetalVisualizerView(audioManager: audioManager, presetManager: presetManager, isRendererPaused: $isRendererPaused) { errorMessage in
-                guard showShaderErrors else { return }
+                guard showShaderErrors else {
+                    // Checkbox off: skip silently to the next preset
+                    presetManager.randomPreset()
+                    return false
+                }
                 shaderErrorMessage = errorMessage
                 showingShaderError = true
                 presetManager.stopAutoCycle()
+                return true
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
