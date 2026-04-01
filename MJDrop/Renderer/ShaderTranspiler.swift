@@ -107,9 +107,12 @@ struct ShaderTranspiler {
             if trimmed.hasPrefix("#define") {
                 preDeclarations += trimmed + "\n"
             }
-            // Keep float/float2/float3/float4 variable declarations, skip sampler decls
-            else if trimmed.hasPrefix("float") && trimmed.contains(";") && !trimmed.contains("sampler") {
-                preDeclarations += trimmed + "\n"
+            // Keep float/float2/float3/float4/int/bool/half variable declarations, skip sampler decls
+            else if trimmed.contains(";") && !trimmed.contains("sampler") {
+                let varDeclPrefixes = ["float", "int", "bool", "half"]
+                if varDeclPrefixes.contains(where: { trimmed.hasPrefix($0) }) {
+                    preDeclarations += trimmed + "\n"
+                }
             }
             pbIdx += 1
         }
@@ -623,6 +626,17 @@ struct ShaderTranspiler {
     /// Also handles assignments (not just declarations).
     private static func fixFloat4FromXyzSample(_ source: String) -> String {
         var lines = source.components(separatedBy: "\n")
+
+        // Pre-scan: collect all `float varname` (scalar) declarations so we can fix
+        // standalone assignments like `scalarVar = expr.xyz` (no type prefix on that line).
+        var scalarVarNames = Set<String>()
+        if let scalarRe = try? NSRegularExpression(pattern: "\\bfloat\\s+([a-zA-Z_]\\w*)") {
+            let ns = source as NSString
+            for m in scalarRe.matches(in: source, range: NSRange(location: 0, length: ns.length)) {
+                if m.numberOfRanges > 1 { scalarVarNames.insert(ns.substring(with: m.range(at: 1))) }
+            }
+        }
+
         var i = 0
         while i < lines.count {
             let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
@@ -633,6 +647,17 @@ struct ShaderTranspiler {
                 if trimmed.hasPrefix(t) && trimmed.contains("=") {
                     declType = String(t.dropLast()) // remove trailing space
                     break
+                }
+            }
+
+            // Also handle standalone assignments to known scalar vars: `scalarName [op]?= ...`
+            if declType == nil {
+                for name in scalarVarNames {
+                    let ops = ["=", "+=", "-=", "*=", "/="]
+                    if ops.contains(where: { trimmed.hasPrefix(name + " " + $0) || trimmed.hasPrefix(name + $0) }) {
+                        declType = "float"
+                        break
+                    }
                 }
             }
 
@@ -1397,12 +1422,17 @@ struct ShaderTranspiler {
             let trimmed = lines[lineIdx].trimmingCharacters(in: .whitespaces)
 
             // Detect if this line assigns to a known float2 variable
+            // Includes plain `=` and compound operators `*=`, `+=`, `-=`, `/=`.
             var assignsToFloat2 = false
             for f2var in float2Vars {
-                if trimmed.hasPrefix("\(f2var) =") || trimmed.hasPrefix("\(f2var)=") {
-                    assignsToFloat2 = true
-                    break
+                let compoundOps = ["=", "*=", "+=", "-=", "/="]
+                for op in compoundOps {
+                    if trimmed.hasPrefix("\(f2var) \(op)") || trimmed.hasPrefix("\(f2var)\(op)") {
+                        assignsToFloat2 = true
+                        break
+                    }
                 }
+                if assignsToFloat2 { break }
                 // Also detect `float2 varname = ...` declarations
                 if trimmed.hasPrefix("float2 ") {
                     assignsToFloat2 = true
@@ -1415,9 +1445,9 @@ struct ShaderTranspiler {
             // Check if the line references any float3 vars without a swizzle
             var line = lines[lineIdx]
             for f3var in float3Vars {
-                // Don't truncate float3 vars that already have a swizzle
-                // Match: word boundary + varname + NOT followed by . or [
-                let pattern = "\\b\(NSRegularExpression.escapedPattern(for: f3var))\\b(?!\\s*[.\\[])"
+                // Don't truncate float3 vars that already have a swizzle.
+                // (?<!\\.) prevents matching swizzle components: e.g. `z` in `foo.z`.
+                let pattern = "(?<!\\.)\\b\(NSRegularExpression.escapedPattern(for: f3var))\\b(?!\\s*[.\\[])"
                 guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
 
                 let nsLine = line as NSString
@@ -1444,12 +1474,126 @@ struct ShaderTranspiler {
         let intermediate = lines.joined(separator: "\n")
         // Also fix float3 vars inside 2D texture sample UV arguments.
         // tex2D UV must be float2; float3 vars in the UV arg need .xy.
-        return fixFloat3InSample2DUV(intermediate, float3Vars: float3Vars)
+        let afterSample = fixFloat3InSample2DUV(intermediate, float3Vars: float3Vars)
+        // Also fix float3 vars inside _md_GetPixel / _md_GetBlur1/2/3 UV arguments.
+        return fixFloat3InGetMacroArgs(afterSample, float3Vars: float3Vars)
+    }
+
+    /// Fix float3 variables that appear in the UV argument of `_md_GetPixel(...)`,
+    /// `_md_GetBlur1(...)`, `_md_GetBlur2(...)`, and `_md_GetBlur3(...)`.
+    /// These functions all take a single float2 UV argument, so any unswizzled
+    /// float3 variable in that argument needs `.xy` appended.
+    private static func fixFloat3InGetMacroArgs(_ source: String, float3Vars: Set<String>) -> String {
+        let macros = ["_md_GetPixel", "_md_GetBlur1", "_md_GetBlur2", "_md_GetBlur3"]
+        guard macros.contains(where: { source.contains($0 + "(") }) else { return source }
+        guard !float3Vars.isEmpty else { return source }
+
+        let chars = Array(source)
+        let n = chars.count
+        var result: [Character] = []
+        result.reserveCapacity(n)
+        var i = 0
+
+        while i < n {
+            // Try to match any macro name at position i
+            var matchedMacro: String? = nil
+            for macro in macros {
+                let macroChars = Array(macro)
+                let macroLen = macroChars.count
+                guard i + macroLen + 1 <= n else { continue }
+                guard chars[i..<(i + macroLen)].elementsEqual(macroChars) else { continue }
+                // Must be followed by '(' (optionally whitespace)
+                var k = i + macroLen
+                while k < n && (chars[k] == " " || chars[k] == "\t") { k += 1 }
+                guard k < n && chars[k] == "(" else { continue }
+                // Must not be preceded by identifier character
+                if i > 0 && (chars[i-1].isLetter || chars[i-1].isNumber || chars[i-1] == "_") { continue }
+                matchedMacro = macro
+                break
+            }
+
+            guard let macro = matchedMacro else {
+                result.append(chars[i])
+                i += 1
+                continue
+            }
+
+            // Append the macro name
+            result.append(contentsOf: macro)
+            i += macro.count
+
+            // Skip whitespace and the opening '('
+            while i < n && (chars[i] == " " || chars[i] == "\t") {
+                result.append(chars[i])
+                i += 1
+            }
+            guard i < n && chars[i] == "(" else { continue }
+            result.append("(")
+            i += 1  // skip '('
+
+            // Extract the full argument expression (depth-balanced)
+            var depth = 1
+            var argChars: [Character] = []
+            while i < n && depth > 0 {
+                if chars[i] == "(" { depth += 1 }
+                else if chars[i] == ")" { depth -= 1; if depth == 0 { break } }
+                argChars.append(chars[i])
+                i += 1
+            }
+
+            // Fix float3 vars in the argument by adding .xy
+            var uvExpr = String(argChars)
+            // Strip _md_f3() wrappers — inner arg is already float2 for these UV-expecting calls.
+            uvExpr = stripMdf3Wrappers(uvExpr)
+            for f3var in float3Vars {
+                let escapedVar = NSRegularExpression.escapedPattern(for: f3var)
+                let pat = "(?<!\\.)\\b\(escapedVar)\\b(?!\\s*[.\\[=])"
+                if let regex = try? NSRegularExpression(pattern: pat) {
+                    let ns = uvExpr as NSString
+                    let matches = regex.matches(in: uvExpr, range: NSRange(location: 0, length: ns.length))
+                    for m in matches.reversed() {
+                        uvExpr = (uvExpr as NSString).replacingCharacters(in: m.range, with: "\(f3var).xy")
+                    }
+                }
+            }
+            result.append(contentsOf: uvExpr)
+
+            // Append closing ')'
+            if i < n && chars[i] == ")" {
+                result.append(")")
+                i += 1
+            }
+        }
+
+        return String(result)
     }
 
     /// Fix float3 variables that appear in the UV argument of texture2d sample calls.
     /// The UV for a 2d texture must be float2, so any unswizzled float3 var needs `.xy`.
     /// 3D textures (names containing "vol") are skipped since their UV is float3.
+    /// Strips `_md_f3(innerExpr)` wrappers, returning just `innerExpr`.
+    /// Used when an expression that was promoted to float3 (for arithmetic) is used
+    /// in a context that requires float2 (e.g., 2D texture UV, _md_GetPixel arg).
+    private static func stripMdf3Wrappers(_ expr: String) -> String {
+        guard expr.contains("_md_f3(") else { return expr }
+        var result = expr
+        let marker = "_md_f3("
+        while let range = result.range(of: marker) {
+            let afterOpen = range.upperBound
+            var depth = 1
+            var idx = afterOpen
+            while idx < result.endIndex && depth > 0 {
+                if result[idx] == "(" { depth += 1 }
+                else if result[idx] == ")" { depth -= 1 }
+                if depth > 0 { idx = result.index(after: idx) }
+            }
+            guard depth == 0, idx < result.endIndex else { break }
+            let inner = String(result[afterOpen..<idx])
+            result.replaceSubrange(range.lowerBound...idx, with: inner)
+        }
+        return result
+    }
+
     private static func fixFloat3InSample2DUV(_ source: String, float3Vars: Set<String>) -> String {
         guard source.contains(".sample(") else { return source }
 
@@ -1529,9 +1673,12 @@ struct ShaderTranspiler {
 
             // Fix: add .xy to any unswizzled float3 var inside the UV expression
             var uvExpr = String(uvChars)
+            // Strip _md_f3() wrappers: they promote float2→float3 for ret arithmetic,
+            // but 2D texture UV must be float2 — the inner arg is already float2.
+            uvExpr = stripMdf3Wrappers(uvExpr)
             for f3var in float3Vars {
                 let escapedVar = NSRegularExpression.escapedPattern(for: f3var)
-                let pat = "\\b\(escapedVar)\\b(?!\\s*[.\\[=])"
+                let pat = "(?<!\\.)\\b\(escapedVar)\\b(?!\\s*[.\\[=])"
                 if let regex = try? NSRegularExpression(pattern: pat) {
                     let ns = uvExpr as NSString
                     let matches = regex.matches(in: uvExpr, range: NSRange(location: 0, length: ns.length))
@@ -2154,7 +2301,26 @@ struct ShaderTranspiler {
         // Sort by length descending to avoid partial replacements (e.g. "bl2" before "bl")
         for name in scalarNames.sorted(by: { $0.count > $1.count }) {
             let escaped = NSRegularExpression.escapedPattern(for: name)
-            // Negative lookbehind prevents matching `vec.name` (where name follows a dot)
+
+            // 1. Multi-component swizzle on a scalar: HLSL allows `scalar.xxx` to broadcast
+            //    to float3, but Metal does not. Replace with floatN(scalar).
+            //    e.g. `crisp.xxx` → `float3(crisp)`, `crisp.xy` → `float2(crisp)`
+            if let multiRegex = try? NSRegularExpression(
+                pattern: "(?<!\\.)\\b\(escaped)\\.([xyzwrgba]{2,4})\\b"
+            ) {
+                let ns = s as NSString
+                let matchList = multiRegex.matches(in: s, range: NSRange(location: 0, length: ns.length))
+                var result = s
+                for m in matchList.reversed() {
+                    let swizzle = ns.substring(with: m.range(at: 1))
+                    let replacement = "float\(swizzle.count)(\(name))"
+                    result = (result as NSString).replacingCharacters(in: m.range, with: replacement)
+                }
+                s = result
+            }
+
+            // 2. Single-component swizzle: `scalar.x` → `scalar` (strip the swizzle).
+            //    Negative lookbehind prevents matching `vec.name` (where name follows a dot).
             s = s.replacingOccurrences(
                 of: "(?<!\\.)\\b\(escaped)\\.(x|y|z|w|r|g|b|a)\\b",
                 with: name,
