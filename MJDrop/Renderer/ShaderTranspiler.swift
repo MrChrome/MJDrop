@@ -151,13 +151,97 @@ struct ShaderTranspiler {
         for line in source.components(separatedBy: "\n") {
             if depth == 0 {
                 let ns = line as NSString
-                if regex.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) != nil {
-                    return true
+                let nsRange = NSRange(location: 0, length: ns.length)
+                if let match = regex.firstMatch(in: line, range: nsRange) {
+                    // Reject matches inside parentheses (function parameter lists).
+                    // Count `(` vs `)` before the match position to get paren depth.
+                    let beforeMatch = ns.substring(to: match.range.location)
+                    let parenDepth = beforeMatch.filter { $0 == "(" }.count
+                                   - beforeMatch.filter { $0 == ")" }.count
+                    if parenDepth == 0 {
+                        return true
+                    }
                 }
             }
             depth += line.filter { $0 == "{" }.count - line.filter { $0 == "}" }.count
         }
         return false
+    }
+
+    /// Returns true if `line` is a comma-separated variable declaration of the form
+    /// `float[N]? a, b, varName, c;` that includes `varName` as one of the declared names.
+    /// Handles depth-0 comma splitting so initializers like `float2(x,y)` are not misinterpreted.
+    private static func isMultiVarDeclaration(_ line: String, declaring varName: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        // Must start with a float type keyword and end with ";"
+        guard trimmed.range(of: #"^float[234]?\s+"#, options: .regularExpression) != nil,
+              trimmed.hasSuffix(";") else { return false }
+        // Extract the vars section: drop type prefix and trailing ";"
+        guard let typeEnd = trimmed.range(of: #"^float[234]?\s+"#, options: .regularExpression) else { return false }
+        let varsSection = String(trimmed[typeEnd.upperBound...].dropLast())
+        // Split on depth-0 commas and check each declared name
+        var depth = 0
+        var current = ""
+        for ch in varsSection {
+            if ch == "(" { depth += 1 }
+            else if ch == ")" { depth -= 1 }
+            else if ch == "," && depth == 0 {
+                let name = String(current.trimmingCharacters(in: .whitespaces)
+                    .prefix(while: { $0.isLetter || $0.isNumber || $0 == "_" }))
+                if name == varName { return true }
+                current = ""
+                continue
+            }
+            current.append(ch)
+        }
+        let lastName = String(current.trimmingCharacters(in: .whitespaces)
+            .prefix(while: { $0.isLetter || $0.isNumber || $0 == "_" }))
+        return lastName == varName
+    }
+
+    /// Returns true if `varName` is used at top scope (brace depth 0) BEFORE any top-scope
+    /// type declaration for it, OR if it is used at top scope but never declared there at all.
+    /// Used to detect HLSL presets that rely on declaration-hoisting (valid HLSL but not Metal/C++).
+    /// The check is paren-depth aware so function parameter declarations (inside `(...)`) are ignored.
+    private static func usedBeforeTopLevelDecl(_ varName: String, in source: String) -> Bool {
+        let escapedVar = NSRegularExpression.escapedPattern(for: varName)
+        guard let declRegex = try? NSRegularExpression(pattern: "float[234]?\\s+\(escapedVar)\\b"),
+              let useRegex  = try? NSRegularExpression(pattern: "\\b\(escapedVar)\\b") else { return false }
+
+        var depth = 0
+        for line in source.components(separatedBy: "\n") {
+            defer {
+                depth += line.filter { $0 == "{" }.count - line.filter { $0 == "}" }.count
+            }
+            guard depth == 0 else { continue }
+
+            let ns = line as NSString
+            let nsRange = NSRange(location: 0, length: ns.length)
+
+            // Check for a top-scope (paren-depth 0) declaration first.
+            // Case 1: simple form `float2 uv2 [= ...]`
+            if let m = declRegex.firstMatch(in: line, range: nsRange) {
+                let before = ns.substring(to: m.range.location)
+                if before.filter({ $0 == "(" }).count == before.filter({ $0 == ")" }).count {
+                    return false  // declaration found before any use — no injection needed
+                }
+            }
+            // Case 2: multi-var form `float2 dz, uv2, other;`
+            // The simple declRegex won't match when varName isn't immediately after the type.
+            // Without this check the use-regex below would fire on the declaration's own name.
+            if isMultiVarDeclaration(line, declaring: varName) {
+                return false  // declaration found before any use — no injection needed
+            }
+
+            // Check for any non-declaration use at top scope on this line.
+            for useMatch in useRegex.matches(in: line, range: nsRange) {
+                let before = ns.substring(to: useMatch.range.location)
+                if before.filter({ $0 == "(" }).count == before.filter({ $0 == ")" }).count {
+                    return true  // use found before any declaration — injection needed
+                }
+            }
+        }
+        return false  // varName not encountered at top scope
     }
 
     private static func applyTransformations(_ body: String) -> String {
@@ -207,10 +291,15 @@ struct ShaderTranspiler {
             s = "float vol = (bass + mid + treb) * 0.333333;\n" + s
         }
 
-        // `uv2` — some presets use a second UV coordinate that isn't declared.
-        // Use top-level check so declarations inside helper function bodies are ignored.
+        // `uv2` — inject a default declaration when uv2 is used before it is declared at top
+        // scope.  This covers: (a) presets that never declare uv2, (b) presets that declare it
+        // only inside helper-function bodies (depth > 0, invisible to the outer scope after
+        // extractHelperFunctions removes those bodies), and (c) presets that declare it AFTER
+        // its first use (valid HLSL declaration-hoisting semantics, but invalid Metal/C++).
+        // fixVariableRedefinitions will strip any subsequent same-scope re-declaration to an
+        // assignment, preserving the correct final value.
         if s.range(of: #"\buv2\b"#, options: .regularExpression) != nil &&
-           !declaredAtTopLevel("uv2", in: s) {
+           usedBeforeTopLevelDecl("uv2", in: s) {
             s = "float2 uv2 = uv;\n" + s
         }
 
@@ -396,6 +485,11 @@ struct ShaderTranspiler {
         // Metal: `(vec >= 0)` yields a bool vector which can't be assigned to float.
         // Convert `expr >= val` to `step(val, expr)` and `expr <= val` to `step(expr, val)`.
         s = fixVectorComparisons(s)
+
+        // Fix scalar variable swizzle: HLSL allows `scalarFloat.x` (returns the scalar),
+        // but Metal does not support member access on scalar types.
+        // Collect all `float name` (not float2/3/4) declarations and strip `.x`/`.r` etc.
+        s = fixScalarVariableSwizzle(s)
 
         return s
     }
@@ -583,6 +677,37 @@ struct ShaderTranspiler {
 
     // MARK: - Variable Redefinition Fix
 
+    /// Removes `varName` from a comma-separated declaration like `float2 a, varName, c;`.
+    /// If `varName` held an initializer it is discarded — the caller has already injected a
+    /// declaration above. Returns the modified line, or "" when all variables were removed.
+    private static func removeVarFromMultiVarDecl(_ line: String, varName: String) -> String {
+        let esc = NSRegularExpression.escapedPattern(for: varName)
+        // Try "varName [= simple_expr]," (middle or first position — trailing comma stays)
+        if let re = try? NSRegularExpression(pattern: "\\b\(esc)\\b(?:\\s*=\\s*[^,;]+)?\\s*,\\s*") {
+            let ms = NSMutableString(string: line)
+            let r = NSRange(location: 0, length: ms.length)
+            if re.firstMatch(in: ms as String, range: r) != nil {
+                re.replaceMatches(in: ms, range: r, withTemplate: "")
+                return ms as String
+            }
+        }
+        // Try ", varName [= simple_expr]" (last position)
+        if let re = try? NSRegularExpression(pattern: ",\\s*\\b\(esc)\\b(?:\\s*=\\s*[^,;]+)?") {
+            let ms = NSMutableString(string: line)
+            let r = NSRange(location: 0, length: ms.length)
+            if re.firstMatch(in: ms as String, range: r) != nil {
+                re.replaceMatches(in: ms, range: r, withTemplate: "")
+                // If only the type keyword remains (all vars removed), blank the line
+                let stripped = (ms as String).trimmingCharacters(in: .whitespaces)
+                if stripped.range(of: #"^(float[234]?|int|bool)\s*;"#, options: .regularExpression) != nil {
+                    return ""
+                }
+                return ms as String
+            }
+        }
+        return line
+    }
+
     /// HLSL (and some Milkdrop presets) declare variables in pre-body
     /// (e.g. `float3 neu, ret1;`) then re-declare them inside the body
     /// (e.g. `float3 ret1 = 0;`). Metal/C++ doesn't allow this in the same scope.
@@ -630,6 +755,7 @@ struct ShaderTranspiler {
                         // Replace `float3 ret1;` with nothing (redundant)
                         let redeclPattern = "\\b\(NSRegularExpression.escapedPattern(for: type))\\s+\(NSRegularExpression.escapedPattern(for: varName))\\b"
                         if let redeclRegex = try? NSRegularExpression(pattern: redeclPattern) {
+                            let beforeReplace = lines[lineIdx]
                             let mutableLine = NSMutableString(string: lines[lineIdx])
                             redeclRegex.replaceMatches(in: mutableLine, range: NSRange(location: 0, length: mutableLine.length), withTemplate: varName)
                             lines[lineIdx] = mutableLine as String
@@ -638,6 +764,13 @@ struct ShaderTranspiler {
                             let stripped = lines[lineIdx].trimmingCharacters(in: .whitespaces)
                             if stripped == "\(varName);" || stripped == "\(varName) ;" {
                                 lines[lineIdx] = ""
+                            } else if lines[lineIdx] == beforeReplace &&
+                                      isMultiVarDeclaration(lines[lineIdx], declaring: varName) {
+                                // Pattern didn't match — varName is in a comma-separated
+                                // declaration list (e.g. `float2 dz,uv2,other;`).
+                                // Confirmed it's a real declaration (not a function-call arg)
+                                // before removing varName from the list.
+                                lines[lineIdx] = removeVarFromMultiVarDecl(lines[lineIdx], varName: varName)
                             }
                         }
                     } else {
@@ -1992,6 +2125,45 @@ struct ShaderTranspiler {
         return true
     }
 
+    /// Removes single-component swizzles (`.x`, `.y`, `.z`, `.w`, `.r`, `.g`, `.b`, `.a`)
+    /// from variables declared as scalar `float` in the source.
+    /// HLSL allows `scalarFloat.x` (it's a no-op returning the same scalar), but Metal
+    /// rejects member access on non-struct/union types.
+    ///
+    /// Uses `(?<!\.)` lookbehind to avoid falsely stripping swizzles from vector members,
+    /// e.g. `vec.x` where `x` happens to also be a scalar variable name.
+    private static func fixScalarVariableSwizzle(_ source: String) -> String {
+        guard let declRegex = try? NSRegularExpression(
+            pattern: #"\bfloat\s+([a-zA-Z_]\w*)"#
+        ) else { return source }
+
+        let nsSource = source as NSString
+        let fullRange = NSRange(location: 0, length: nsSource.length)
+
+        var scalarNames = Set<String>()
+        for match in declRegex.matches(in: source, range: fullRange) {
+            guard match.numberOfRanges > 1 else { continue }
+            let r = match.range(at: 1)
+            guard r.location != NSNotFound else { continue }
+            scalarNames.insert(nsSource.substring(with: r))
+        }
+
+        guard !scalarNames.isEmpty else { return source }
+
+        var s = source
+        // Sort by length descending to avoid partial replacements (e.g. "bl2" before "bl")
+        for name in scalarNames.sorted(by: { $0.count > $1.count }) {
+            let escaped = NSRegularExpression.escapedPattern(for: name)
+            // Negative lookbehind prevents matching `vec.name` (where name follows a dot)
+            s = s.replacingOccurrences(
+                of: "(?<!\\.)\\b\(escaped)\\.(x|y|z|w|r|g|b|a)\\b",
+                with: name,
+                options: .regularExpression
+            )
+        }
+        return s
+    }
+
     // MARK: - Metal Source Generation
 
     // MARK: - Helper Function Extraction & Inline Expansion
@@ -2345,6 +2517,9 @@ struct ShaderTranspiler {
 
         // Helper: HLSL length() accepts scalars, Metal does not
         static float length(float x) { return abs(x); }
+
+        // Helper: HLSL normalize() accepts scalars (returns sign(x)), Metal does not
+        static float normalize(float x) { return sign(x); }
 
         // Helpers for HLSL-style implicit float2→float3 conversion
         static float3 _md_f3(float2 v) { return float3(v, 0); }

@@ -349,6 +349,30 @@ struct PresetListView: View {
     }
 }
 
+// MARK: - Error Group Model
+
+private struct ErrorGroup: Identifiable {
+    var id: String { pattern }
+    let pattern: String
+    let presets: [(name: String, shaderType: String)]
+}
+
+/// Extracts a normalized error pattern from a Metal compiler error string.
+/// Strips line/column info and trailing hints like "; did you mean 'X'?".
+private func extractErrorPattern(from errorText: String) -> String {
+    let lines = errorText.components(separatedBy: "\n")
+    for line in lines {
+        if let range = line.range(of: "error: ", options: .literal) {
+            var msg = String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+            if let hintRange = msg.range(of: "; did you mean") {
+                msg = String(msg[..<hintRange.lowerBound])
+            }
+            return msg
+        }
+    }
+    return lines.first?.trimmingCharacters(in: .whitespaces) ?? errorText
+}
+
 // MARK: - Shader Test Report View
 
 struct ShaderTestReportView: View {
@@ -357,6 +381,26 @@ struct ShaderTestReportView: View {
 
     @State private var expandedPreset: UUID? = nil
     @State private var selectedShaderType: String = "warp" // "warp" or "comp"
+    @State private var reportMode: ReportMode = .byPreset
+    @State private var expandedGroup: String? = nil
+
+    private enum ReportMode { case byPreset, byError }
+
+    private var errorGroups: [ErrorGroup] {
+        var groups: [String: [(name: String, shaderType: String)]] = [:]
+        for result in testManager.failedResults {
+            if let err = result.warpError {
+                let pattern = extractErrorPattern(from: err)
+                groups[pattern, default: []].append((name: result.presetName, shaderType: "warp"))
+            }
+            if let err = result.compError {
+                let pattern = extractErrorPattern(from: err)
+                groups[pattern, default: []].append((name: result.presetName, shaderType: "comp"))
+            }
+        }
+        return groups.map { ErrorGroup(pattern: $0.key, presets: $0.value) }
+            .sorted { $0.presets.count > $1.presets.count }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -419,18 +463,39 @@ struct ShaderTestReportView: View {
 
             // Failed presets list with expandable error details
             if !testManager.failedResults.isEmpty {
-                Text("Failed Presets:")
-                    .font(.system(.caption, design: .monospaced).bold())
+                HStack {
+                    Text("Failed Presets:")
+                        .font(.system(.caption, design: .monospaced).bold())
+                    Spacer()
+                    Picker("View", selection: $reportMode) {
+                        Text("By Preset").tag(ReportMode.byPreset)
+                        Text("By Error").tag(ReportMode.byError)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 180)
+                }
 
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(testManager.failedResults) { result in
-                            FailedPresetRow(
-                                result: result,
-                                isExpanded: expandedPreset == result.id,
-                                selectedShaderType: $selectedShaderType
-                            ) {
-                                expandedPreset = expandedPreset == result.id ? nil : result.id
+                        if reportMode == .byPreset {
+                            ForEach(testManager.failedResults) { result in
+                                FailedPresetRow(
+                                    result: result,
+                                    isExpanded: expandedPreset == result.id,
+                                    selectedShaderType: $selectedShaderType
+                                ) {
+                                    expandedPreset = expandedPreset == result.id ? nil : result.id
+                                }
+                            }
+                        } else {
+                            ForEach(errorGroups) { group in
+                                ErrorGroupRow(
+                                    group: group,
+                                    isExpanded: expandedGroup == group.id
+                                ) {
+                                    expandedGroup = expandedGroup == group.id ? nil : group.id
+                                }
                             }
                         }
                     }
@@ -482,6 +547,19 @@ struct ShaderTestReportView: View {
             }
         }
 
+        let groups = errorGroups
+        if !groups.isEmpty {
+            lines.append("")
+            lines.append("Error Groups (ranked by frequency):")
+            lines.append("------------------------------------")
+            for group in groups {
+                lines.append("  [\(group.presets.count)x] \(group.pattern)")
+                for preset in group.presets {
+                    lines.append("    - \(preset.name) [\(preset.shaderType)]")
+                }
+            }
+        }
+
         return lines.joined(separator: "\n")
     }
 }
@@ -495,10 +573,15 @@ private struct FailedPresetRow: View {
     let onTap: () -> Void
 
     private var activeError: String? {
-        selectedShaderType == "warp" ? result.warpError : result.compError
+        // If only one shader type failed, always show that one
+        if result.warpResult == .failed && result.compResult != .failed { return result.warpError }
+        if result.compResult == .failed && result.warpResult != .failed { return result.compError }
+        return selectedShaderType == "warp" ? result.warpError : result.compError
     }
     private var activeSource: String? {
-        selectedShaderType == "warp" ? result.warpMetalSource : result.compMetalSource
+        if result.warpResult == .failed && result.compResult != .failed { return result.warpMetalSource }
+        if result.compResult == .failed && result.warpResult != .failed { return result.compMetalSource }
+        return selectedShaderType == "warp" ? result.warpMetalSource : result.compMetalSource
     }
 
     var body: some View {
@@ -545,7 +628,7 @@ private struct FailedPresetRow: View {
             // Expanded error detail panel
             if isExpanded {
                 VStack(alignment: .leading, spacing: 6) {
-                    // Shader type picker (only show if both failed)
+                    // Shader type picker (only needed when both failed)
                     if result.warpResult == .failed && result.compResult == .failed {
                         Picker("Shader", selection: $selectedShaderType) {
                             Text("Warp").tag("warp")
@@ -554,6 +637,14 @@ private struct FailedPresetRow: View {
                         .pickerStyle(.segmented)
                         .labelsHidden()
                         .frame(width: 160)
+                    } else if result.warpResult == .failed {
+                        Text("Warp shader error")
+                            .font(.system(.caption2, design: .monospaced).bold())
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Comp shader error")
+                            .font(.system(.caption2, design: .monospaced).bold())
+                            .foregroundStyle(.secondary)
                     }
 
                     // Error text
@@ -596,6 +687,78 @@ private struct FailedPresetRow: View {
                 .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 4))
             }
         }
+    }
+}
+
+// MARK: - Error Group Row
+
+private struct ErrorGroupRow: View {
+    let group: ErrorGroup
+    let isExpanded: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: onTap) {
+                HStack(spacing: 8) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 12)
+                    // Count badge — colour indicates severity
+                    Text("\(group.presets.count)")
+                        .font(.system(.caption2, design: .monospaced).bold())
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(countColor(group.presets.count), in: RoundedRectangle(cornerRadius: 4))
+                    Text(group.pattern)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer()
+                }
+                .padding(.vertical, 4)
+                .padding(.horizontal, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(Array(group.presets.enumerated()), id: \.offset) { item in
+                        HStack(spacing: 6) {
+                            Text("•")
+                                .foregroundStyle(.secondary)
+                                .font(.caption2)
+                            Text(item.element.name)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Spacer()
+                            Text(item.element.shaderType)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 3))
+                        }
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 6)
+                .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 4))
+            }
+        }
+    }
+
+    private func countColor(_ count: Int) -> Color {
+        if count >= 20 { return .red }
+        if count >= 10 { return .orange }
+        if count >= 5  { return Color(hue: 0.11, saturation: 0.9, brightness: 0.8) }
+        return .gray
     }
 }
 

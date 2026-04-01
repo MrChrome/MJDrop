@@ -149,8 +149,9 @@ final class RenderPipeline {
             return V2CompileResult(pipeline: nil, error: msg)
         }
         guard let vertFunc = defaultLibrary.makeFunction(name: "warpVertexV2") else {
-            print("[RenderPipeline] warpVertexV2 not found in default library")
-            return V2CompileResult(pipeline: nil, error: nil)
+            let msg = "warpVertexV2 not found in default library"
+            print("[RenderPipeline] \(msg)")
+            return V2CompileResult(pipeline: nil, error: msg)
         }
 
         let desc = MTLRenderPipelineDescriptor()
@@ -183,8 +184,9 @@ final class RenderPipeline {
             return V2CompileResult(pipeline: nil, error: msg)
         }
         guard let vertFunc = defaultLibrary.makeFunction(name: "compositeVertex") else {
-            print("[RenderPipeline] compositeVertex not found in default library")
-            return V2CompileResult(pipeline: nil, error: nil)
+            let msg = "compositeVertex not found in default library"
+            print("[RenderPipeline] \(msg)")
+            return V2CompileResult(pipeline: nil, error: msg)
         }
 
         let desc = MTLRenderPipelineDescriptor()
@@ -213,8 +215,23 @@ final class RenderPipeline {
             let errorMsg = "\(error)"
             print("[RenderPipeline] \(label) shader compilation failed:\n\(errorMsg)")
             let lines = source.components(separatedBy: "\n")
-            let preview = lines.prefix(10).enumerated().map { "\($0.offset + 1): \($0.element)" }.joined(separator: "\n")
-            print("[RenderPipeline] Source preview:\n\(preview)")
+            // Extract error line numbers from the error message (e.g. "program_source:181:5:")
+            let lineNumbers = errorMsg.components(separatedBy: "\n")
+                .compactMap { line -> Int? in
+                    guard let m = line.range(of: #"program_source:(\d+):"#, options: .regularExpression) else { return nil }
+                    let numStr = line[m].components(separatedBy: ":").dropFirst().first ?? ""
+                    return Int(numStr)
+                }
+            if let firstLine = lineNumbers.first {
+                let contextStart = max(0, firstLine - 6)
+                let contextEnd = min(lines.count - 1, firstLine + 4)
+                let context = lines[contextStart...contextEnd].enumerated()
+                    .map { "\(contextStart + $0.offset + 1): \($0.element)" }.joined(separator: "\n")
+                print("[RenderPipeline] Source context (lines \(contextStart + 1)-\(contextEnd + 1)):\n\(context)")
+            } else {
+                let preview = lines.prefix(15).enumerated().map { "\($0.offset + 1): \($0.element)" }.joined(separator: "\n")
+                print("[RenderPipeline] Source preview:\n\(preview)")
+            }
             return (nil, errorMsg)
         }
     }
