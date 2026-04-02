@@ -57,7 +57,7 @@ final class ShaderTestManager {
         let presetsCopy = presets
         let totalCount = presets.count
 
-        Task.detached { [weak self] in
+        Task.detached(priority: .userInitiated) { [weak self] in
             guard let device = MTLCreateSystemDefaultDevice(),
                   let library = device.makeDefaultLibrary()
             else {
