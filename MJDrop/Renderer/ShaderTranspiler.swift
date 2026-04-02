@@ -629,11 +629,31 @@ struct ShaderTranspiler {
 
         // Pre-scan: collect all `float varname` (scalar) declarations so we can fix
         // standalone assignments like `scalarVar = expr.xyz` (no type prefix on that line).
+        // Uses depth-0 comma splitting so ALL vars in `float dx, dy;` are captured,
+        // not just the first one (the old single-capture regex missed e.g. `dy`).
         var scalarVarNames = Set<String>()
-        if let scalarRe = try? NSRegularExpression(pattern: "\\bfloat\\s+([a-zA-Z_]\\w*)") {
+        if let scalarRe = try? NSRegularExpression(pattern: "\\bfloat\\s+([^;{}\\n]+);") {
             let ns = source as NSString
             for m in scalarRe.matches(in: source, range: NSRange(location: 0, length: ns.length)) {
-                if m.numberOfRanges > 1 { scalarVarNames.insert(ns.substring(with: m.range(at: 1))) }
+                if m.numberOfRanges > 1 {
+                    let varList = ns.substring(with: m.range(at: 1))
+                    // Split on depth-0 commas to avoid splitting inside initializers like float2(a,b)
+                    var parts: [String] = []
+                    var cur = ""
+                    var depth = 0
+                    for ch in varList {
+                        if ch == "(" { depth += 1 }
+                        else if ch == ")" { depth -= 1 }
+                        else if ch == "," && depth == 0 { parts.append(cur); cur = ""; continue }
+                        cur.append(ch)
+                    }
+                    parts.append(cur)
+                    for part in parts {
+                        let name = String(part.trimmingCharacters(in: .whitespaces)
+                            .prefix(while: { $0.isLetter || $0.isNumber || $0 == "_" }))
+                        if !name.isEmpty { scalarVarNames.insert(name) }
+                    }
+                }
             }
         }
 
@@ -658,6 +678,16 @@ struct ShaderTranspiler {
                         declType = "float"
                         break
                     }
+                }
+            }
+
+            // Also handle single-component vector accesses like `uv.x +=` or `ret.y =`.
+            // A single-char swizzle component is always scalar float, even if the parent
+            // variable is float2/float3/float4. Exclude double-char swizzles like `.xy`.
+            if declType == nil {
+                if trimmed.range(of: #"^[a-zA-Z_]\w*\.[xyzwrgba](?![xyzwrgba])\s*[-+*/]?=(?!=)"#,
+                                 options: .regularExpression) != nil {
+                    declType = "float"
                 }
             }
 
@@ -801,6 +831,33 @@ struct ShaderTranspiler {
                     } else {
                         declaredVars[varName] = type
                     }
+                }
+            }
+
+            // Handle multi-line declarations where ';' is on a later line.
+            // The declRegex above requires ';', so `float dx = longFunc(\n  arg\n);`
+            // is missed on the first line. Detect and fix these by checking if the
+            // line starts with a type keyword followed by an already-declared variable.
+            if matches.isEmpty && !line.contains(";") {
+                let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+                let typeKeywords = ["float4", "float3", "float2", "float", "int", "bool"]
+                for typeKw in typeKeywords {
+                    guard trimmedLine.hasPrefix(typeKw + " ") || trimmedLine.hasPrefix(typeKw + "\t") else { continue }
+                    let rest = String(trimmedLine.dropFirst(typeKw.count)).trimmingCharacters(in: .whitespaces)
+                    let varName = String(rest.prefix(while: { $0.isLetter || $0.isNumber || $0 == "_" }))
+                    guard !varName.isEmpty else { break }
+                    if declaredVars[varName] != nil {
+                        // Redeclaration on a multi-line statement — strip the type prefix
+                        let redeclPat = "\\b\(NSRegularExpression.escapedPattern(for: typeKw))\\s+\(NSRegularExpression.escapedPattern(for: varName))\\b"
+                        if let re = try? NSRegularExpression(pattern: redeclPat) {
+                            let ms = NSMutableString(string: lines[lineIdx])
+                            re.replaceMatches(in: ms, range: NSRange(location: 0, length: ms.length), withTemplate: varName)
+                            lines[lineIdx] = ms as String
+                        }
+                    } else {
+                        declaredVars[varName] = typeKw
+                    }
+                    break
                 }
             }
         }
