@@ -61,12 +61,21 @@ struct ContentView: View {
                         Text("\(presetManager.currentIndex + 1)/\(presetManager.presetCount)")
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
+                        let isV2 = presetManager.currentPreset.psVersion >= 2
+                        Text(isV2 ? "V2" : "V1")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(isV2 ? .green : .secondary)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(
+                                Capsule().fill(isV2 ? Color.green.opacity(0.2) : Color.secondary.opacity(0.15))
+                            )
                         Text(presetManager.currentName)
                             .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.cyan)
                             .lineLimit(1)
                             .truncationMode(.tail)
-                            .frame(maxWidth: 200, alignment: .trailing)
+                            .frame(maxWidth: 400, alignment: .trailing)
                     }
                     .onTapGesture {
                         presetSearchText = ""
@@ -328,6 +337,15 @@ struct PresetListView: View {
                                 .lineLimit(1)
                                 .truncationMode(.tail)
                             Spacer()
+                            let isV2 = item.preset.psVersion >= 2
+                            Text(isV2 ? "V2" : "V1")
+                                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(isV2 ? .purple : .secondary)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(
+                                    Capsule().fill(isV2 ? Color.purple.opacity(0.2) : Color.secondary.opacity(0.15))
+                                )
                             if item.index == presetManager.currentIndex {
                                 Image(systemName: "checkmark")
                                     .foregroundStyle(.cyan)
